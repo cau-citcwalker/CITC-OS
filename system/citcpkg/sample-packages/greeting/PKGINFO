@@ -1,0 +1,4 @@
+name=greeting
+version=1.0
+description=환영 인사 프로그램
+depends=hello

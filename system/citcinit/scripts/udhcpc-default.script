@@ -1,0 +1,107 @@
+#!/bin/sh
+# udhcpc 디폴트 스크립트 - DHCP 이벤트 핸들러
+# ==============================================
+#
+# udhcpc란?
+#   busybox에 포함된 경량 DHCP 클라이언트.
+#   "micro DHCP client"의 약자.
+#
+# udhcpc의 작동 방식:
+#   1. DHCP 서버에서 네트워크 설정 정보를 받음
+#   2. 이 스크립트를 호출하면서 환경변수로 정보를 전달
+#   3. 스크립트가 실제로 네트워크를 설정
+#
+# 왜 udhcpc가 직접 설정하지 않고 스크립트를 호출하나?
+#   유연성! 시스템마다 네트워크 설정 방법이 다를 수 있음.
+#   udhcpc는 "정보를 받는 것"에만 집중하고,
+#   "설정하는 것"은 각 시스템에 맞게 스크립트로 처리.
+#
+# 환경변수 (udhcpc가 설정해줌):
+#   $1        = 이벤트 종류 (bound, renew, deconfig 등)
+#   $interface = 네트워크 인터페이스 이름 (예: eth0)
+#   $ip       = 할당받은 IP 주소 (예: 10.0.2.15)
+#   $subnet   = 서브넷 마스크 (예: 255.255.255.0)
+#   $router   = 게이트웨이 주소 (예: 10.0.2.2)
+#   $dns      = DNS 서버 주소 (예: 10.0.2.3)
+#   $mask     = 서브넷 마스크 비트 수 (예: 24)
+
+# CIDR 프리픽스 길이 계산
+# 255.255.255.0 → /24 로 변환
+calc_prefix() {
+    local mask="$1"
+    local prefix=0
+    local IFS='.'
+
+    for octet in $mask; do
+        case "$octet" in
+            255) prefix=$((prefix + 8)) ;;
+            254) prefix=$((prefix + 7)) ;;
+            252) prefix=$((prefix + 6)) ;;
+            248) prefix=$((prefix + 5)) ;;
+            240) prefix=$((prefix + 4)) ;;
+            224) prefix=$((prefix + 3)) ;;
+            192) prefix=$((prefix + 2)) ;;
+            128) prefix=$((prefix + 1)) ;;
+            0)   ;;
+        esac
+    done
+
+    echo "$prefix"
+}
+
+case "$1" in
+    deconfig)
+        #
+        # deconfig: 네트워크 초기화 (리셋)
+        #
+        # DHCP 협상 시작 전에 호출됨.
+        # 기존 IP 설정을 제거하여 깨끗한 상태에서 시작.
+        #
+        ip addr flush dev "$interface"
+        ip link set "$interface" up
+        ;;
+
+    bound|renew)
+        #
+        # bound:  새로운 IP 할당 받음 (처음)
+        # renew:  기존 IP 갱신 (임대 기간 연장)
+        #
+        # 둘 다 같은 방식으로 처리: IP, 라우트, DNS 설정
+        #
+
+        # 1. IP 주소 설정
+        PREFIX=$(calc_prefix "${subnet:-255.255.255.0}")
+        ip addr flush dev "$interface"
+        ip addr add "$ip/$PREFIX" dev "$interface"
+
+        # 2. 기본 게이트웨이 설정
+        #    "default via 10.0.2.2" = 모든 외부 트래픽을 이 주소로 보내라
+        if [ -n "$router" ]; then
+            # 기존 기본 라우트 삭제 후 새로 설정
+            ip route del default 2>/dev/null
+            ip route add default via "$router" dev "$interface"
+        fi
+
+        # 3. DNS 설정
+        #    /etc/resolv.conf = DNS 리졸버 설정 파일
+        #    "nameserver 10.0.2.3" = 이 서버에게 DNS 질의를 보내라
+        if [ -n "$dns" ]; then
+            echo "# DNS - udhcpc가 자동 생성" > /etc/resolv.conf
+            for ns in $dns; do
+                echo "nameserver $ns" >> /etc/resolv.conf
+            done
+        fi
+
+        echo "[NET] IP=$ip/$PREFIX GW=$router DNS=$dns"
+        ;;
+
+    nak)
+        #
+        # nak: DHCP 서버가 요청을 거부함
+        # 보통 IP 주소 충돌 등의 이유
+        #
+        echo "[NET] DHCP NAK received: IP assignment denied"
+        ;;
+esac
+
+exit 0
