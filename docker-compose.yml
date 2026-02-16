@@ -1,0 +1,24 @@
+# CITC OS - 패키지 저장소 서버
+# =============================
+#
+# nginx로 build/repo/ 디렉토리를 HTTP로 제공.
+#
+# 사용법:
+#   1. 먼저 패키지 빌드:  bash tools/build-sample-packages.sh
+#   2. 서버 시작:         docker compose up
+#   3. 서버 종료:         docker compose down (또는 Ctrl+C)
+#
+# QEMU에서:
+#   citcpkg update    → http://10.0.2.2:8080/PKGINDEX 다운로드
+#
+# 브라우저에서 확인:
+#   http://localhost:8080/PKGINDEX
+
+services:
+  repo:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./build/repo:/usr/share/nginx/html:ro
+    restart: unless-stopped

@@ -1,0 +1,235 @@
+# CITC OS 커널 설정 (v0.1 - 최소 QEMU 부팅용)
+# ================================================
+#
+# 이 설정은 QEMU 가상머신에서 CITC OS를 부팅하기 위한 최소 설정입니다.
+# 실제 하드웨어에서 부팅하려면 더 많은 드라이버를 활성화해야 합니다.
+#
+# 사용법:
+#   cp citcos_defconfig /path/to/linux-source/.config
+#   cd /path/to/linux-source
+#   make olddefconfig    # 빠진 옵션을 기본값으로 채움
+#   make -j$(nproc)      # 빌드 (모든 CPU 코어 사용)
+#
+# 커널 설정의 원칙:
+#   1. 필요한 것만 켜라 (커널 크기 ↓, 부팅 속도 ↑, 보안 ↑)
+#   2. QEMU에서 먼저 테스트 → 실 하드웨어는 나중에
+#   3. 모르면 y보다 m (모듈)을 선택 → 필요할 때만 로드
+
+# ===================
+# 기본 시스템 설정
+# ===================
+CONFIG_64BIT=y
+# → x86_64 (64비트) 아키텍처. 현대 PC는 모두 64비트.
+#   32비트(x86)도 가능하지만, 메모리 제한(4GB)이 있으므로 64비트 사용.
+
+CONFIG_SMP=y
+# → SMP (Symmetric Multi-Processing). 멀티코어 CPU 지원.
+#   이게 없으면 CPU 코어 1개만 사용. 현대 CPU는 모두 멀티코어.
+
+CONFIG_SCHED_AUTOGROUP=y
+# → 프로세스 그룹별 자동 스케줄링. 데스크탑 반응성 향상.
+#   무거운 컴파일 중에도 UI가 부드럽게 동작하게 해줌.
+
+CONFIG_PREEMPT=y
+# → 선점형 커널. 커널 코드 실행 중에도 다른 프로세스로 전환 가능.
+#   데스크탑/게이밍 OS에 필수. 서버는 PREEMPT_NONE이 더 나음.
+
+CONFIG_HZ_1000=y
+# → 타이머 주파수 1000Hz. 1ms마다 스케줄러가 동작.
+#   게이밍에 중요: 입력 지연 최소화. 서버는 HZ_250이 적당.
+
+# ===================
+# 프로세스 관리
+# ===================
+CONFIG_NAMESPACES=y
+CONFIG_USER_NS=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+# → 네임스페이스: 프로세스 격리 기술. 컨테이너(Docker)의 기반.
+#   나중에 Windows 호환 레이어에서도 프로세스 격리에 사용할 수 있음.
+
+CONFIG_CGROUPS=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CGROUP_CPUACCT=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_FREEZER=y
+CONFIG_MEMCG=y
+# → 컨트롤 그룹: 프로세스 그룹의 리소스 제한.
+#   Windows의 Job Objects를 에뮬레이션할 때 사용.
+#   예: "이 프로세스 그룹은 RAM 2GB까지만 사용 가능"
+
+# ===================
+# 메모리 관리
+# ===================
+CONFIG_TRANSPARENT_HUGEPAGE=y
+# → 투명 대용량 페이지. 기본 페이지(4KB) 대신 2MB 페이지 자동 사용.
+#   메모리 많이 사용하는 프로그램(게임, IDE)의 성능 향상.
+
+CONFIG_COMPACTION=y
+# → 메모리 압축. 파편화된 메모리를 정리하여 대용량 페이지 할당 가능하게 함.
+
+# ===================
+# 파일시스템
+# ===================
+CONFIG_EXT4_FS=y
+# → EXT4: Linux 기본 파일시스템. CITC OS의 루트 파일시스템으로 사용.
+
+CONFIG_TMPFS=y
+# → tmpfs: RAM 기반 파일시스템. /tmp, /run에 사용.
+#   재부팅하면 사라짐. SSD 수명 절약.
+
+CONFIG_PROC_FS=y
+# → procfs: /proc. 프로세스 정보를 파일로 제공.
+#   우리 citcinit에서 마운트하는 바로 그것.
+
+CONFIG_SYSFS=y
+# → sysfs: /sys. 하드웨어 정보를 파일로 제공.
+
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+# → devtmpfs: /dev. 장치 파일 자동 생성.
+#   DEVTMPFS_MOUNT=y: 커널이 자동으로 /dev를 마운트해줌.
+
+CONFIG_FUSE_FS=m
+# → FUSE: 유저 공간 파일시스템. 나중에 Windows 드라이브 매핑에 유용.
+
+CONFIG_NTFS3_FS=m
+# → NTFS 읽기/쓰기 지원. Windows 파티션 접근에 필요.
+
+CONFIG_VFAT_FS=y
+CONFIG_FAT_DEFAULT_UTF8=y
+# → FAT/VFAT: EFI 부트 파티션, USB 드라이브에 사용.
+
+# ===================
+# 블록 디바이스
+# ===================
+CONFIG_BLK_DEV_INITRD=y
+# → initramfs/initrd 지원. 부팅 시 임시 루트 파일시스템.
+#   커널이 우리 citcinit을 찾을 수 있게 해주는 핵심 옵션!
+
+CONFIG_RD_GZIP=y
+CONFIG_RD_BZIP2=y
+CONFIG_RD_XZ=y
+CONFIG_RD_ZSTD=y
+# → initramfs 압축 형식 지원.
+
+# ===================
+# QEMU 가상 하드웨어 (테스트용)
+# ===================
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_VIRTIO_INPUT=y
+# → VirtIO: QEMU의 가상 하드웨어 인터페이스.
+#   실제 하드웨어를 에뮬레이션하는 것보다 훨씬 빠름.
+#   이거 없으면 QEMU에서 디스크, 네트워크를 사용할 수 없음.
+
+CONFIG_DRM=y
+CONFIG_DRM_VIRTIO_GPU=y
+# → VirtIO GPU: QEMU의 가상 GPU.
+#   나중에 Wayland 컴포지터 테스트에 필요.
+
+CONFIG_HW_RANDOM_VIRTIO=y
+# → VirtIO 난수 생성기. 보안(암호화)에 필요.
+
+# ===================
+# 입력 장치 (키보드, 마우스)
+# ===================
+# 핵심 입력 서브시스템
+CONFIG_INPUT=y
+# → 입력 서브시스템 코어. 모든 키보드/마우스/터치스크린의 기반.
+
+CONFIG_INPUT_EVDEV=y
+# → "Event Device" 인터페이스. /dev/input/eventX 파일을 생성!
+#   이것이 없으면 입력 장치가 있어도 유저스페이스에서 접근 불가.
+#   struct input_event를 read()할 수 있게 해주는 핵심 옵션.
+
+# PS/2 키보드/마우스 (QEMU 기본 제공)
+CONFIG_INPUT_KEYBOARD=y
+CONFIG_KEYBOARD_ATKBD=y
+# → AT 키보드 드라이버. PS/2 키보드 지원.
+#   QEMU의 -vga std는 PS/2 키보드를 에뮬레이션함.
+
+CONFIG_INPUT_MOUSE=y
+CONFIG_MOUSE_PS2=y
+# → PS/2 마우스 드라이버.
+
+CONFIG_SERIO=y
+CONFIG_SERIO_I8042=y
+# → i8042: PS/2 컨트롤러 칩.
+#   키보드와 마우스를 연결하는 물리적 인터페이스.
+#   QEMU에서도 이 칩을 에뮬레이션함.
+
+# USB 지원 (QEMU의 USB 태블릿에 필요)
+CONFIG_USB_SUPPORT=y
+CONFIG_USB=y
+CONFIG_USB_EHCI_HCD=y
+CONFIG_USB_XHCI_HCD=y
+# → USB 호스트 컨트롤러. QEMU는 USB 태블릿 장치를 기본 제공.
+#   USB 태블릿은 절대 좌표(EV_ABS)를 사용 — 마우스 통합에 유리.
+
+CONFIG_HID=y
+CONFIG_HID_GENERIC=y
+CONFIG_USB_HID=y
+# → HID (Human Interface Device). USB 키보드/마우스/태블릿의 프로토콜.
+#   USB 장치가 "나는 마우스" "나는 키보드"임을 알려주는 표준.
+
+# ===================
+# 실제 하드웨어 (나중에 활성화)
+# ===================
+# 아래는 실제 PC에서 부팅할 때 필요한 것들.
+# 지금은 주석으로 남겨두고, Phase 0에서는 QEMU만 타겟.
+
+# CONFIG_SATA_AHCI=y        # SATA 디스크 (대부분의 SSD/HDD)
+# CONFIG_NVME_CORE=y        # NVMe SSD (최신 고속 SSD)
+# CONFIG_USB_SUPPORT=y      # USB 지원
+# CONFIG_USB_XHCI_HCD=y    # USB 3.0+
+# CONFIG_USB_STORAGE=y      # USB 저장장치
+# CONFIG_NETDEVICES=y       # 네트워크 디바이스
+# CONFIG_E1000E=m           # Intel 이더넷
+# CONFIG_R8169=m            # Realtek 이더넷
+# CONFIG_IWLWIFI=m          # Intel WiFi
+# CONFIG_SND=y              # 사운드
+# CONFIG_SND_HDA_INTEL=m   # Intel HDA 오디오
+
+# ===================
+# 네트워킹 (기본)
+# ===================
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+# → 기본 네트워크 스택. 웹 브라우저, 패키지 관리자에 필수.
+
+CONFIG_PACKET=y
+# → Raw 패킷 접근. 네트워크 도구에 필요.
+
+CONFIG_UNIX=y
+# → Unix 도메인 소켓. 프로세스 간 통신(IPC)의 핵심.
+#   D-Bus, Wayland 모두 Unix 소켓을 사용.
+#   Windows의 Named Pipes를 에뮬레이션할 때도 사용.
+
+# ===================
+# 보안
+# ===================
+CONFIG_SECURITY=y
+CONFIG_SECCOMP=y
+CONFIG_SECCOMP_FILTER=y
+# → seccomp: 시스템 콜 필터링. 프로세스가 사용할 수 있는
+#   시스템 콜을 제한. 보안 샌드박스에 필수.
+#   나중에 Windows 앱 샌드박싱에 사용.
+
+# ===================
+# 디버그 (개발 중에만)
+# ===================
+CONFIG_PRINTK=y
+# → 커널 메시지 출력. dmesg 명령으로 확인.
+
+CONFIG_EARLY_PRINTK=y
+# → 부팅 초기 메시지. 부팅 문제 디버깅에 필수.
+
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+# → 시리얼 콘솔. QEMU에서 커널 메시지를 호스트 터미널에 출력.
+#   "qemu -serial stdio" 옵션으로 사용.
