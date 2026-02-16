@@ -1,0 +1,19 @@
+# IDE / AI
+.claude/
+CLAUDE.md
+
+# Build artifacts
+build/
+*/build/
+*/*/build/
+*/*/*/build/
+*/*/*/*/build/
+*.o
+*.exe
+*.iso
+
+# initramfs / rootfs
+initramfs/
+initramfs.cpio.gz
+iso_root/
+packages/
