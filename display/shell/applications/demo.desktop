@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Demo
+Exec=/usr/bin/cdp_demo
+Icon=demo
+Type=Application
+Categories=Development;

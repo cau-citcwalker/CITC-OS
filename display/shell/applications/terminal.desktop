@@ -1,0 +1,6 @@
+[Desktop Entry]
+Name=Terminal
+Exec=/usr/bin/citcterm
+Icon=terminal
+Type=Application
+Categories=System;
