@@ -149,6 +149,43 @@ uint32_t reg_set_value(HKEY key, const char *value_name,
 		       uint32_t type, const void *data,
 		       uint32_t data_len);
 
+/*
+ * RegDeleteKeyA — 레지스트리 키 삭제
+ *
+ * 키가 비어 있어야 삭제 가능 (하위 키 없어야 함).
+ * 실제 Windows 동작과 동일.
+ */
+uint32_t reg_delete_key(HKEY parent, const char *sub_key);
+
+/*
+ * RegDeleteValueA — 레지스트리 값 삭제
+ *
+ * 지정된 이름의 값 파일을 삭제.
+ */
+uint32_t reg_delete_value(HKEY key, const char *value_name);
+
+/*
+ * RegEnumKeyExA — 하위 키 열거
+ *
+ * index: 0부터 순서대로 호출 (ERROR_NO_MORE_ITEMS까지)
+ * name: [out] 키 이름
+ * name_len: [in/out] 이름 버퍼 크기 / 실제 길이
+ */
+uint32_t reg_enum_key(HKEY key, uint32_t index,
+		      char *name, uint32_t *name_len);
+
+/*
+ * RegEnumValueA — 값 열거
+ *
+ * index: 0부터 순서대로 호출 (ERROR_NO_MORE_ITEMS까지)
+ * name: [out] 값 이름
+ * name_len: [in/out] 이름 버퍼 크기 / 실제 길이
+ * type: [out] 값 타입 (NULL 가능)
+ */
+uint32_t reg_enum_value(HKEY key, uint32_t index,
+			char *name, uint32_t *name_len,
+			uint32_t *type);
+
 /* ============================================================
  * 스텁 테이블
  * ============================================================ */

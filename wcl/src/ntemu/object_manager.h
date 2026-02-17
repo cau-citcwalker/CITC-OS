@@ -39,8 +39,9 @@ enum ob_type {
 	OB_FREE = 0,        /* 빈 슬롯 */
 	OB_FILE,            /* 일반 파일 */
 	OB_CONSOLE,         /* 콘솔 (stdin/stdout/stderr) */
-	OB_MUTEX,           /* 뮤텍스 (미래용) */
-	OB_EVENT,           /* 이벤트 (미래용) */
+	OB_MUTEX,           /* Win32 뮤텍스 */
+	OB_EVENT,           /* Win32 이벤트 */
+	OB_THREAD,          /* Win32 스레드 */
 	OB_REGISTRY_KEY,    /* 레지스트리 키 */
 };
 
@@ -84,5 +85,12 @@ struct ob_entry *ob_ref_handle(HANDLE h);
  * 스레드 안전.
  */
 void ob_close_handle(HANDLE h);
+
+/*
+ * ob_create_handle_ex — extra 포인터 포함 핸들 할당
+ *
+ * 스레드/이벤트/뮤텍스 등 추가 데이터가 필요한 객체용.
+ */
+HANDLE ob_create_handle_ex(enum ob_type type, void *extra);
 
 #endif /* CITC_OBJECT_MANAGER_H */

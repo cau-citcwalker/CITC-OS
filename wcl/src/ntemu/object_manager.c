@@ -104,6 +104,30 @@ struct ob_entry *ob_ref_handle(HANDLE h)
 }
 
 /* ============================================================
+ * ob_create_handle_ex — extra 포인터 포함 핸들 할당
+ * ============================================================ */
+HANDLE ob_create_handle_ex(enum ob_type type, void *extra)
+{
+	HANDLE result = INVALID_HANDLE_VALUE;
+
+	pthread_mutex_lock(&table_lock);
+
+	for (int i = 3; i < OB_MAX_HANDLES; i++) {
+		if (handle_table[i].type == OB_FREE) {
+			handle_table[i].type = type;
+			handle_table[i].fd = -1;
+			handle_table[i].access = 0;
+			handle_table[i].extra = extra;
+			result = (HANDLE)(uintptr_t)(i + OB_HANDLE_OFFSET);
+			break;
+		}
+	}
+
+	pthread_mutex_unlock(&table_lock);
+	return result;
+}
+
+/* ============================================================
  * ob_close_handle — 핸들 해제
  * ============================================================ */
 void ob_close_handle(HANDLE h)

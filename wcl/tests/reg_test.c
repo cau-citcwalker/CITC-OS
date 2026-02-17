@@ -1,12 +1,8 @@
 /*
- * reg_test.c — CITC OS WCL 레지스트리 테스트
- * =============================================
+ * reg_test.c — CITC OS WCL 레지스트리 + advapi32 테스트
+ * ======================================================
  *
- * Class 24에서 구현한 레지스트리 API를 테스트합니다:
- *   RegCreateKeyExA, RegSetValueExA, RegQueryValueExA, RegCloseKey
- *
- * 주의: /etc/citc-registry/ 디렉토리가 필요합니다.
- *   sudo mkdir -p /etc/citc-registry/HKLM/SOFTWARE
+ * Class 24 (기본 CRUD) + Class 49 (열거, 삭제, 보안) 테스트.
  *
  * 빌드:
  *   x86_64-w64-mingw32-gcc -nostdlib -o reg_test.exe reg_test.c \
@@ -65,6 +61,25 @@ __declspec(dllimport) DWORD __stdcall RegQueryValueExA(
 	DWORD *lpType, BYTE *lpData, DWORD *lpcbData);
 
 __declspec(dllimport) DWORD __stdcall RegCloseKey(HKEY hKey);
+
+__declspec(dllimport) DWORD __stdcall RegDeleteKeyA(HKEY hKey, LPCSTR lpSubKey);
+
+__declspec(dllimport) DWORD __stdcall RegDeleteValueA(HKEY hKey,
+						       LPCSTR lpValueName);
+
+__declspec(dllimport) DWORD __stdcall RegEnumKeyExA(
+	HKEY hKey, DWORD dwIndex, char *lpName, DWORD *lpcchName,
+	DWORD *lpReserved, char *lpClass, DWORD *lpcchClass,
+	void *lpftLastWriteTime);
+
+__declspec(dllimport) DWORD __stdcall RegEnumValueA(
+	HKEY hKey, DWORD dwIndex, char *lpValueName, DWORD *lpcchValueName,
+	DWORD *lpReserved, DWORD *lpType, BYTE *lpData, DWORD *lpcbData);
+
+__declspec(dllimport) BOOL __stdcall GetUserNameA(char *lpBuffer,
+						  DWORD *pcbBuffer);
+
+#define ERROR_NO_MORE_ITEMS 259
 
 /* === 유틸리티 === */
 
@@ -241,6 +256,214 @@ void _start(void)
 	} else {
 		print(out, "FAIL\n");
 		fail++;
+	}
+
+	/* ============================================================
+	 * Class 49 확장 테스트
+	 * ============================================================ */
+
+	print(out, "\n--- Class 49: advapi32 확장 ---\n\n");
+
+	/* 7. RegCreateKeyExA — 서브키 생성 (열거 테스트용) */
+	print(out, "[7] RegCreateKeyExA(HKLM\\SOFTWARE\\CitcTest\\Sub1)... ");
+	HKEY hTestKey = NULL;
+
+	ret = RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+			      "SOFTWARE\\CitcTest",
+			      0, NULL, 0, KEY_ALL_ACCESS, NULL,
+			      &hTestKey, NULL);
+	if (ret != ERROR_SUCCESS) {
+		print(out, "FAIL (reopen parent)\n");
+		fail++;
+	} else {
+		HKEY hSub1 = NULL;
+		DWORD disp = 0;
+
+		ret = RegCreateKeyExA(hTestKey, "Sub1",
+				      0, NULL, 0, KEY_ALL_ACCESS, NULL,
+				      &hSub1, &disp);
+		if (ret == ERROR_SUCCESS && hSub1) {
+			print(out, "OK\n");
+			pass++;
+			RegCloseKey(hSub1);
+		} else {
+			print(out, "FAIL (error=");
+			print_num(out, ret);
+			print(out, ")\n");
+			fail++;
+		}
+	}
+
+	/* 8. RegEnumKeyExA — 서브키 열거 */
+	print(out, "[8] RegEnumKeyExA(index=0)... ");
+	if (hTestKey) {
+		char enumName[128];
+		DWORD enumLen = sizeof(enumName);
+
+		ret = RegEnumKeyExA(hTestKey, 0, enumName, &enumLen,
+				    NULL, NULL, NULL, NULL);
+		if (ret == ERROR_SUCCESS && enumLen > 0) {
+			print(out, "OK (\"");
+			print(out, enumName);
+			print(out, "\")\n");
+			pass++;
+		} else {
+			print(out, "FAIL (error=");
+			print_num(out, ret);
+			print(out, ")\n");
+			fail++;
+		}
+	} else {
+		print(out, "SKIP\n");
+	}
+
+	/* 9. RegEnumKeyExA — 인덱스 초과 */
+	print(out, "[9] RegEnumKeyExA(index=99) -> NO_MORE_ITEMS... ");
+	if (hTestKey) {
+		char enumName[128];
+		DWORD enumLen = sizeof(enumName);
+
+		ret = RegEnumKeyExA(hTestKey, 99, enumName, &enumLen,
+				    NULL, NULL, NULL, NULL);
+		if (ret == ERROR_NO_MORE_ITEMS) {
+			print(out, "OK\n");
+			pass++;
+		} else {
+			print(out, "FAIL (ret=");
+			print_num(out, ret);
+			print(out, ")\n");
+			fail++;
+		}
+	} else {
+		print(out, "SKIP\n");
+	}
+
+	/* 10. RegEnumValueA — 값 열거 */
+	print(out, "[10] RegEnumValueA(index=0)... ");
+	if (hTestKey) {
+		char valName[128];
+		DWORD valNameLen = sizeof(valName);
+		DWORD valType = 0;
+
+		ret = RegEnumValueA(hTestKey, 0, valName, &valNameLen,
+				    NULL, &valType, NULL, NULL);
+		if (ret == ERROR_SUCCESS && valNameLen > 0) {
+			print(out, "OK (\"");
+			print(out, valName);
+			print(out, "\" type=");
+			print_num(out, valType);
+			print(out, ")\n");
+			pass++;
+		} else {
+			print(out, "FAIL (error=");
+			print_num(out, ret);
+			print(out, ")\n");
+			fail++;
+		}
+	} else {
+		print(out, "SKIP\n");
+	}
+
+	/* 11. RegDeleteValueA — 값 삭제 */
+	print(out, "[11] RegDeleteValueA(\"TestStr\")... ");
+	if (hTestKey) {
+		ret = RegDeleteValueA(hTestKey, "TestStr");
+		if (ret == ERROR_SUCCESS) {
+			print(out, "OK\n");
+			pass++;
+		} else {
+			print(out, "FAIL (error=");
+			print_num(out, ret);
+			print(out, ")\n");
+			fail++;
+		}
+	} else {
+		print(out, "SKIP\n");
+	}
+
+	/* 12. RegDeleteValueA — 다른 값도 삭제 */
+	print(out, "[12] RegDeleteValueA(\"TestDword\")... ");
+	if (hTestKey) {
+		ret = RegDeleteValueA(hTestKey, "TestDword");
+		if (ret == ERROR_SUCCESS) {
+			print(out, "OK\n");
+			pass++;
+		} else {
+			print(out, "FAIL (error=");
+			print_num(out, ret);
+			print(out, ")\n");
+			fail++;
+		}
+	} else {
+		print(out, "SKIP\n");
+	}
+
+	/* 13. RegDeleteKeyA — 서브키 삭제 */
+	print(out, "[13] RegDeleteKeyA(\"Sub1\")... ");
+	if (hTestKey) {
+		ret = RegDeleteKeyA(hTestKey, "Sub1");
+		if (ret == ERROR_SUCCESS) {
+			print(out, "OK\n");
+			pass++;
+		} else {
+			print(out, "FAIL (error=");
+			print_num(out, ret);
+			print(out, ")\n");
+			fail++;
+		}
+	} else {
+		print(out, "SKIP\n");
+	}
+
+	/* 14. RegCloseKey — 테스트 키 닫기 */
+	print(out, "[14] RegCloseKey(hTestKey)... ");
+	if (hTestKey) {
+		ret = RegCloseKey(hTestKey);
+		if (ret == ERROR_SUCCESS) {
+			print(out, "OK\n");
+			pass++;
+		} else {
+			print(out, "FAIL\n");
+			fail++;
+		}
+		hTestKey = NULL;
+	} else {
+		print(out, "SKIP\n");
+	}
+
+	/* 15. RegDeleteKeyA — 부모 키 삭제 (빈 상태여야 함) */
+	print(out, "[15] RegDeleteKeyA(HKLM\\SOFTWARE\\CitcTest)... ");
+	ret = RegDeleteKeyA(HKEY_LOCAL_MACHINE, "SOFTWARE\\CitcTest");
+	if (ret == ERROR_SUCCESS) {
+		print(out, "OK\n");
+		pass++;
+	} else {
+		print(out, "FAIL (error=");
+		print_num(out, ret);
+		print(out, ")\n");
+		fail++;
+	}
+
+	/* 16. GetUserNameA — 사용자 이름 조회 */
+	print(out, "[16] GetUserNameA... ");
+	{
+		char userName[128];
+		DWORD nameLen = sizeof(userName);
+
+		for (int i = 0; i < 128; i++)
+			userName[i] = 0;
+
+		BOOL ok = GetUserNameA(userName, &nameLen);
+
+		if (ok && nameLen > 0 && userName[0] != '\0') {
+			print(out, "OK (\"");
+			print(out, userName);
+			print(out, "\")\n");
+			pass++;
+		} else {
+			print(out, "FAIL\n");
+			fail++;
+		}
 	}
 
 	/* 결과 요약 */

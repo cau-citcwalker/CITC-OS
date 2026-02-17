@@ -19,9 +19,14 @@
  * 값 파일 포맷:
  *   [type:4바이트][length:4바이트][data:N바이트]
  *
- * 이 구현의 한계:
- *   - 열거(RegEnumKey/Value) 미구현
- *   - 보안/접근 제어 없음
+ * 구현 상태:
+ *   - CRUD: RegCreateKey, RegOpenKey, RegSetValue, RegQueryValue,
+ *           RegDeleteKey, RegDeleteValue
+ *   - 열거: RegEnumKeyEx, RegEnumValue (opendir/readdir 기반)
+ *   - 보안: GetUserName, OpenProcessToken (스텁)
+ *   - 서비스: OpenSCManager, OpenService (스텁)
+ *
+ * 한계:
  *   - 알림(RegNotifyChangeKeyValue) 미구현
  *   - 트랜잭션 미지원
  */
@@ -33,6 +38,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
 #include "registry.h"
 #include "object_manager.h"
@@ -458,6 +464,216 @@ uint32_t reg_set_value(HKEY key, const char *value_name,
 }
 
 /* ============================================================
+ * RegDeleteKeyA — 키 삭제
+ * ============================================================
+ *
+ * 디렉토리 삭제 (rmdir). 하위 키가 있으면 실패.
+ * 실제 Windows: 하위 키가 있으면 ERROR_ACCESS_DENIED.
+ */
+
+uint32_t reg_delete_key(HKEY parent, const char *sub_key)
+{
+	if (!sub_key || !sub_key[0])
+		return ERROR_INVALID_PARAMETER;
+
+	char path[REG_MAX_PATH];
+
+	if (build_key_path(parent, sub_key, path, sizeof(path)) < 0)
+		return ERROR_INVALID_HANDLE;
+
+	if (rmdir(path) < 0) {
+		if (errno == ENOENT)
+			return ERROR_FILE_NOT_FOUND;
+		if (errno == ENOTEMPTY)
+			return ERROR_ACCESS_DENIED;
+		return ERROR_ACCESS_DENIED;
+	}
+
+	return ERROR_SUCCESS;
+}
+
+/* ============================================================
+ * RegDeleteValueA — 값 삭제
+ * ============================================================ */
+
+uint32_t reg_delete_value(HKEY key, const char *value_name)
+{
+	if (!value_name || !value_name[0])
+		return ERROR_INVALID_PARAMETER;
+
+	char path[REG_MAX_PATH];
+
+	if (build_key_path(key, NULL, path, sizeof(path)) < 0)
+		return ERROR_INVALID_HANDLE;
+
+	char value_path[REG_MAX_PATH];
+
+	snprintf(value_path, sizeof(value_path), "%.768s/%.254s",
+		 path, value_name);
+
+	if (unlink(value_path) < 0) {
+		if (errno == ENOENT)
+			return ERROR_FILE_NOT_FOUND;
+		return ERROR_ACCESS_DENIED;
+	}
+
+	return ERROR_SUCCESS;
+}
+
+/* ============================================================
+ * RegEnumKeyExA — 하위 키 열거
+ * ============================================================
+ *
+ * opendir + readdir로 디렉토리만 수집, index번째 반환.
+ * 실제 Windows는 내부 인덱스를 관리하지만,
+ * 우리는 매번 전체 스캔 (간단하지만 O(n²)).
+ */
+
+uint32_t reg_enum_key(HKEY key, uint32_t index,
+		      char *name, uint32_t *name_len)
+{
+	if (!name || !name_len)
+		return ERROR_INVALID_PARAMETER;
+
+	char path[REG_MAX_PATH];
+
+	if (build_key_path(key, NULL, path, sizeof(path)) < 0)
+		return ERROR_INVALID_HANDLE;
+
+	DIR *dir = opendir(path);
+
+	if (!dir)
+		return ERROR_FILE_NOT_FOUND;
+
+	uint32_t current = 0;
+	struct dirent *de;
+
+	while ((de = readdir(dir)) != NULL) {
+		/* . 과 .. 건너뛰기 */
+		if (de->d_name[0] == '.' &&
+		    (de->d_name[1] == '\0' ||
+		     (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+			continue;
+
+		/* 디렉토리만 (서브키) */
+		char full[REG_MAX_PATH];
+
+		snprintf(full, sizeof(full), "%.768s/%.254s",
+			 path, de->d_name);
+
+		struct stat st;
+
+		if (stat(full, &st) < 0 || !S_ISDIR(st.st_mode))
+			continue;
+
+		if (current == index) {
+			uint32_t len = strlen(de->d_name);
+
+			if (len >= *name_len) {
+				closedir(dir);
+				*name_len = len + 1;
+				return ERROR_MORE_DATA;
+			}
+
+			memcpy(name, de->d_name, len + 1);
+			*name_len = len;
+			closedir(dir);
+			return ERROR_SUCCESS;
+		}
+
+		current++;
+	}
+
+	closedir(dir);
+	return ERROR_NO_MORE_ITEMS;
+}
+
+/* ============================================================
+ * RegEnumValueA — 값 열거
+ * ============================================================
+ *
+ * opendir + readdir로 일반 파일만 수집, index번째 반환.
+ */
+
+uint32_t reg_enum_value(HKEY key, uint32_t index,
+			char *name, uint32_t *name_len,
+			uint32_t *type)
+{
+	if (!name || !name_len)
+		return ERROR_INVALID_PARAMETER;
+
+	char path[REG_MAX_PATH];
+
+	if (build_key_path(key, NULL, path, sizeof(path)) < 0)
+		return ERROR_INVALID_HANDLE;
+
+	DIR *dir = opendir(path);
+
+	if (!dir)
+		return ERROR_FILE_NOT_FOUND;
+
+	uint32_t current = 0;
+	struct dirent *de;
+
+	while ((de = readdir(dir)) != NULL) {
+		if (de->d_name[0] == '.' &&
+		    (de->d_name[1] == '\0' ||
+		     (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+			continue;
+
+		/* 일반 파일만 (값) */
+		char full[REG_MAX_PATH];
+
+		snprintf(full, sizeof(full), "%.768s/%.254s",
+			 path, de->d_name);
+
+		struct stat st;
+
+		if (stat(full, &st) < 0 || !S_ISREG(st.st_mode))
+			continue;
+
+		if (current == index) {
+			uint32_t len = strlen(de->d_name);
+
+			if (len >= *name_len) {
+				closedir(dir);
+				*name_len = len + 1;
+				return ERROR_MORE_DATA;
+			}
+
+			memcpy(name, de->d_name, len + 1);
+			*name_len = len;
+
+			/* 값 타입 읽기 */
+			if (type) {
+				int fd = open(full, O_RDONLY);
+
+				if (fd >= 0) {
+					struct reg_value_header hdr;
+
+					if (read(fd, &hdr, sizeof(hdr))
+					    == sizeof(hdr))
+						*type = hdr.type;
+					else
+						*type = REG_NONE;
+					close(fd);
+				} else {
+					*type = REG_NONE;
+				}
+			}
+
+			closedir(dir);
+			return ERROR_SUCCESS;
+		}
+
+		current++;
+	}
+
+	closedir(dir);
+	return ERROR_NO_MORE_ITEMS;
+}
+
+/* ============================================================
  * advapi32.dll 스텁 함수 (ms_abi 래퍼)
  * ============================================================
  *
@@ -512,16 +728,227 @@ static uint32_t adv_RegSetValueExA(HKEY key, const char *value_name,
 	return reg_set_value(key, value_name, type, data, data_len);
 }
 
+__attribute__((ms_abi))
+static uint32_t adv_RegDeleteKeyA(HKEY parent, const char *sub_key)
+{
+	return reg_delete_key(parent, sub_key);
+}
+
+__attribute__((ms_abi))
+static uint32_t adv_RegDeleteValueA(HKEY key, const char *value_name)
+{
+	return reg_delete_value(key, value_name);
+}
+
+__attribute__((ms_abi))
+static uint32_t adv_RegEnumKeyExA(HKEY key, uint32_t index,
+				  char *name, uint32_t *name_len,
+				  uint32_t *reserved, char *class_name,
+				  uint32_t *class_len, void *last_write)
+{
+	(void)reserved;
+	(void)class_name;
+	(void)class_len;
+	(void)last_write;
+	return reg_enum_key(key, index, name, name_len);
+}
+
+__attribute__((ms_abi))
+static uint32_t adv_RegEnumValueA(HKEY key, uint32_t index,
+				  char *name, uint32_t *name_len,
+				  uint32_t *reserved, uint32_t *type,
+				  void *data, uint32_t *data_len)
+{
+	(void)reserved;
+	(void)data;
+	(void)data_len;
+	return reg_enum_value(key, index, name, name_len, type);
+}
+
+/* ============================================================
+ * 보안 스텁 (advapi32.dll)
+ * ============================================================
+ *
+ * 대부분의 앱이 GetUserName, OpenProcessToken 등을 호출.
+ * 최소한의 성공 응답으로 크래시 방지.
+ */
+
+__attribute__((ms_abi))
+static BOOL adv_GetUserNameA(char *lpBuffer, uint32_t *pcbBuffer)
+{
+	const char *name = "citcuser";
+	uint32_t len = 9; /* strlen("citcuser") + 1 */
+
+	if (!lpBuffer || !pcbBuffer || *pcbBuffer < len) {
+		if (pcbBuffer)
+			*pcbBuffer = len;
+		return FALSE;
+	}
+
+	memcpy(lpBuffer, name, len);
+	*pcbBuffer = len;
+	return TRUE;
+}
+
+__attribute__((ms_abi))
+static BOOL adv_OpenProcessToken(HANDLE hProcess, uint32_t dwDesiredAccess,
+				 HANDLE *pTokenHandle)
+{
+	(void)hProcess;
+	(void)dwDesiredAccess;
+
+	/*
+	 * 더미 토큰 핸들 반환 — 고정 값.
+	 * 앱이 GetTokenInformation을 호출하면 최소한의 정보 반환.
+	 */
+	if (pTokenHandle)
+		*pTokenHandle = (HANDLE)(uintptr_t)0xDEAD0001;
+	return TRUE;
+}
+
+__attribute__((ms_abi))
+static BOOL adv_GetTokenInformation(HANDLE hToken, int tokenInfoClass,
+				    void *tokenInfo, uint32_t tokenInfoLen,
+				    uint32_t *returnLen)
+{
+	(void)hToken;
+	(void)tokenInfoClass;
+	(void)tokenInfo;
+	(void)tokenInfoLen;
+
+	/* 최소 구현: 필요 크기만 반환, 실패 */
+	if (returnLen)
+		*returnLen = 0;
+	return FALSE;
+}
+
+__attribute__((ms_abi))
+static BOOL adv_LookupAccountSidA(const char *lpSystemName, void *Sid,
+				   char *Name, uint32_t *cchName,
+				   char *ReferencedDomainName,
+				   uint32_t *cchReferencedDomainName,
+				   int *peUse)
+{
+	(void)lpSystemName;
+	(void)Sid;
+	(void)peUse;
+
+	/* 최소 구현: "citcuser" / "CITC" 반환 */
+	if (Name && cchName && *cchName >= 9) {
+		memcpy(Name, "citcuser", 9);
+		*cchName = 8;
+	}
+	if (ReferencedDomainName && cchReferencedDomainName &&
+	    *cchReferencedDomainName >= 5) {
+		memcpy(ReferencedDomainName, "CITC", 5);
+		*cchReferencedDomainName = 4;
+	}
+	return TRUE;
+}
+
+/* ============================================================
+ * 서비스 스텁 (advapi32.dll)
+ * ============================================================
+ *
+ * 서비스 관리자 API — 대부분의 앱이 설치 시 호출.
+ * 실제 서비스 설치/시작은 지원하지 않으나,
+ * 크래시 방지를 위해 적절한 에러코드 반환.
+ */
+
+__attribute__((ms_abi))
+static HANDLE adv_OpenSCManagerA(const char *lpMachineName,
+				 const char *lpDatabaseName,
+				 uint32_t dwDesiredAccess)
+{
+	(void)lpMachineName;
+	(void)lpDatabaseName;
+	(void)dwDesiredAccess;
+
+	/* 더미 SC 핸들 */
+	return (HANDLE)(uintptr_t)0xDEAD0002;
+}
+
+__attribute__((ms_abi))
+static HANDLE adv_OpenServiceA(HANDLE hSCManager, const char *lpServiceName,
+			       uint32_t dwDesiredAccess)
+{
+	(void)hSCManager;
+	(void)lpServiceName;
+	(void)dwDesiredAccess;
+
+	/* 서비스 존재하지 않음 */
+	return NULL;
+}
+
+__attribute__((ms_abi))
+static HANDLE adv_CreateServiceA(HANDLE hSCManager, const char *lpServiceName,
+				 const char *lpDisplayName,
+				 uint32_t dwDesiredAccess,
+				 uint32_t dwServiceType,
+				 uint32_t dwStartType,
+				 uint32_t dwErrorControl,
+				 const char *lpBinaryPathName,
+				 const char *lpLoadOrderGroup,
+				 uint32_t *lpdwTagId,
+				 const char *lpDependencies,
+				 const char *lpServiceStartName,
+				 const char *lpPassword)
+{
+	(void)hSCManager; (void)lpServiceName; (void)lpDisplayName;
+	(void)dwDesiredAccess; (void)dwServiceType; (void)dwStartType;
+	(void)dwErrorControl; (void)lpBinaryPathName; (void)lpLoadOrderGroup;
+	(void)lpdwTagId; (void)lpDependencies; (void)lpServiceStartName;
+	(void)lpPassword;
+
+	/* 접근 거부 — 서비스 설치 방지 */
+	return NULL;
+}
+
+__attribute__((ms_abi))
+static BOOL adv_StartServiceA(HANDLE hService, uint32_t dwNumServiceArgs,
+			      const char **lpServiceArgVectors)
+{
+	(void)hService;
+	(void)dwNumServiceArgs;
+	(void)lpServiceArgVectors;
+	return FALSE;
+}
+
+__attribute__((ms_abi))
+static BOOL adv_CloseServiceHandle(HANDLE hSCObject)
+{
+	(void)hSCObject;
+	return TRUE;
+}
+
 /* ============================================================
  * advapi32 스텁 테이블
  * ============================================================ */
 
 struct stub_entry advapi32_stub_table[] = {
+	/* 레지스트리 */
 	{ "advapi32.dll", "RegOpenKeyExA",    (void *)adv_RegOpenKeyExA },
 	{ "advapi32.dll", "RegCreateKeyExA",  (void *)adv_RegCreateKeyExA },
 	{ "advapi32.dll", "RegCloseKey",      (void *)adv_RegCloseKey },
 	{ "advapi32.dll", "RegQueryValueExA", (void *)adv_RegQueryValueExA },
 	{ "advapi32.dll", "RegSetValueExA",   (void *)adv_RegSetValueExA },
+	{ "advapi32.dll", "RegDeleteKeyA",    (void *)adv_RegDeleteKeyA },
+	{ "advapi32.dll", "RegDeleteValueA",  (void *)adv_RegDeleteValueA },
+	{ "advapi32.dll", "RegEnumKeyExA",    (void *)adv_RegEnumKeyExA },
+	{ "advapi32.dll", "RegEnumValueA",    (void *)adv_RegEnumValueA },
+
+	/* 보안 */
+	{ "advapi32.dll", "GetUserNameA",       (void *)adv_GetUserNameA },
+	{ "advapi32.dll", "OpenProcessToken",   (void *)adv_OpenProcessToken },
+	{ "advapi32.dll", "GetTokenInformation",(void *)adv_GetTokenInformation },
+	{ "advapi32.dll", "LookupAccountSidA",  (void *)adv_LookupAccountSidA },
+
+	/* 서비스 */
+	{ "advapi32.dll", "OpenSCManagerA",     (void *)adv_OpenSCManagerA },
+	{ "advapi32.dll", "OpenServiceA",       (void *)adv_OpenServiceA },
+	{ "advapi32.dll", "CreateServiceA",     (void *)adv_CreateServiceA },
+	{ "advapi32.dll", "StartServiceA",      (void *)adv_StartServiceA },
+	{ "advapi32.dll", "CloseServiceHandle", (void *)adv_CloseServiceHandle },
 
 	{ NULL, NULL, NULL }
 };
