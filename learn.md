@@ -43,6 +43,28 @@
 - [Class 34: D3D11 Device + Context](#class-34-d3d11-device--context)
 - [Class 35: 소프트웨어 래스터라이저 + Hello Triangle](#class-35-소프트웨어-래스터라이저--hello-triangle)
 
+### Phase 5: 고급 Windows 호환성 확장
+
+- [Class 48: Win32 Threading & Synchronization](#class-48-win32-threading--synchronization)
+- [Class 49: advapi32 (Registry & Security)](#class-49-advapi32-registry--security)
+- [Class 50: COM Runtime (ole32)](#class-50-com-runtime-ole32)
+- [Class 51: ws2_32 (Winsock2 Networking)](#class-51-ws2_32-winsock2-networking)
+- [Class 52: kernel32 확장 (시간, 파일시스템, 시스템 정보)](#class-52-kernel32-확장-시간-파일시스템-시스템-정보)
+- [Class 53: D3D11 고급 기능 + Shader Cache](#class-53-d3d11-고급-기능--shader-cache)
+- [Class 54: D3D12 기초](#class-54-d3d12-기초)
+- [Class 55: 통합 테스트 + 실제 앱 실행](#class-55-통합-테스트--실제-앱-실행)
+
+### Phase 6: OS 인프라 강화
+
+- [Class 56: 오디오 서버 (citcaudio)](#class-56-오디오-서버-citcaudio)
+- [Class 57: 오디오 WCL 통합 (dsound/xaudio2 → citcaudio)](#class-57-오디오-wcl-통합-dsoundxaudio2--citcaudio)
+- [Class 58: 데미지 트래킹 (Damage Tracking)](#class-58-데미지-트래킹-damage-tracking)
+- [Class 59: 윈도우 리사이즈 + 최소화/최대화](#class-59-윈도우-리사이즈--최소화최대화)
+- [Class 60: 알파 블렌딩 + 윈도우 그림자](#class-60-알파-블렌딩--윈도우-그림자)
+- [Class 61: PSF2 폰트 + 바탕화면](#class-61-psf2-폰트--바탕화면)
+- [Class 62: 클립보드 (복사/붙여넣기)](#class-62-클립보드-복사붙여넣기)
+- [Class 63: 통합 테스트 + 해상도 관리 + 폴리시](#class-63-통합-테스트--해상도-관리--폴리시)
+
 ### 부록
 
 - [공통 교훈: 자주 발생한 패턴](#공통-교훈)
@@ -5208,3 +5230,3108 @@ Phase 4 (Class 32-35)에서 달성한 것:
 - **셰이더 바이트코드 없이도 렌더링 가능**: InputLayout의 시맨틱 이름("POSITION", "COLOR")만으로 버텍스 데이터의 역할을 결정하면, 셰이더 파싱 없이 고정 함수 파이프라인으로 동작. DXBC 파싱은 나중에 필요할 때 추가
 - **Edge function 래스터라이징의 우아함**: 하나의 공식 `(bx-ax)(py-ay) - (by-ay)(px-ax)`으로 내부 판별 + 무게중심 좌표(색상 보간용)를 동시에 얻음. GPU가 하드웨어로 수행하는 것을 CPU에서 재현하면 그래픽스 파이프라인의 원리를 깊이 이해할 수 있음
 - **DLL 간 내부 호출은 stub_table을 우회**: stub_table은 PE 앱의 임포트 해석용이지, 내부 C 코드 간 호출용이 아님. 내부 호출은 헤더에 선언된 일반 C 함수로 직접 호출하는 것이 ABI 안전성과 성능 모두에서 우월
+
+---
+
+## Class 36: Constant Buffer + 3D MVP 변환
+
+> Constant Buffer는 CPU에서 셰이더로 uniform 데이터(행렬, 조명, 색상 등)를 전달하는 메커니즘이다.
+> 모든 실제 D3D11 앱이 `VSSetConstantBuffers`로 MVP 행렬을 바인딩하여 3D 변환을 수행한다.
+
+### 핵심 개념 — Constant Buffer (CB)
+
+```
+CPU (앱)                         GPU (셰이더)
+   │                                  │
+   │  CreateBuffer(CONSTANT_BUFFER)   │
+   │  UpdateSubresource(mvp_matrix)   │
+   │  VSSetConstantBuffers(slot=0)    │
+   │ ─────────────────────────────→   │
+   │                            cb0[0] = mvp row 0
+   │                            cb0[1] = mvp row 1
+   │                            cb0[2] = mvp row 2
+   │                            cb0[3] = mvp row 3
+   │                                  │
+   │                            position = mul(pos, mvp)
+```
+
+D3D11의 CB는 16바이트 정렬 (float4 단위). slot 0~7에 바인딩 가능.
+VS와 PS 각각 독립된 CB 슬롯을 가진다.
+
+### 핵심 개념 — MVP 변환
+
+3D 좌표 → 화면 좌표 변환은 세 행렬의 곱:
+
+```
+MVP = Model × View × Projection
+
+Model:       오브젝트 → 월드 (위치, 회전, 크기)
+View:        월드 → 카메라 (카메라 위치/방향)
+Projection:  카메라 → 클립 (원근법/직교 투영)
+```
+
+4×4 행렬 × float4 벡터 곱셈:
+```c
+static void mat4_mul_vec4(const float *m, const float *v, float *out)
+{
+    for (int r = 0; r < 4; r++) {
+        out[r] = m[r*4+0]*v[0] + m[r*4+1]*v[1]
+               + m[r*4+2]*v[2] + m[r*4+3]*v[3];
+    }
+}
+```
+
+클립 좌표 → NDC 변환 (perspective divide):
+```c
+ndc_x = clip_x / clip_w;
+ndc_y = clip_y / clip_w;
+ndc_z = clip_z / clip_w;
+```
+
+### 구현 — context 구조체 확장
+
+```c
+struct d3d11_context {
+    /* ... 기존 필드 ... */
+    int vs_cb_idx[8];   /* VS CB 슬롯 → resource_table 인덱스, -1 = unbound */
+    int ps_cb_idx[8];   /* PS CB 슬롯 */
+};
+```
+
+### 구현 — 주요 함수
+
+| 함수 | 설명 |
+|------|------|
+| `ctx_VSSetConstantBuffers` | VS CB 슬롯에 버퍼 바인딩 |
+| `ctx_PSSetConstantBuffers` | PS CB 슬롯에 버퍼 바인딩 |
+| `ctx_UpdateSubresource` | USAGE_DEFAULT 리소스에 CPU 데이터 복사 |
+| `mat4_mul_vec4` (내부) | 4×4 행렬 × float4 벡터 곱셈 |
+
+### 구현 — Draw() MVP 적용
+
+CB slot 0이 바인딩되어 있으면 첫 64바이트를 4×4 MVP 행렬로 해석하여 각 버텍스에 적용:
+
+```c
+if (c->vs_cb_idx[0] >= 0) {
+    struct d3d_resource *cb = &resource_table[c->vs_cb_idx[0]];
+    if (cb->data && cb->size >= 64) {
+        float transformed[4];
+        mat4_mul_vec4((const float *)cb->data, raw_pos, transformed);
+        /* perspective divide */
+        if (fabsf(transformed[3]) > 1e-6f) {
+            tri[j].pos[0] = transformed[0] / transformed[3];
+            tri[j].pos[1] = transformed[1] / transformed[3];
+            tri[j].pos[2] = transformed[2] / transformed[3];
+            tri[j].pos[3] = transformed[3];
+        }
+    }
+}
+```
+
+CB 미바인딩 시 기존 pass-through 동작을 유지하여 하위 호환성 보장.
+
+---
+
+## Class 37: 깊이 버퍼 (Z-Buffer) + 렌더 스테이트
+
+> Z-Buffer: 3D 장면에서 가까운 물체가 먼 물체를 가리도록 처리. 없으면 마지막에 그린 것이 항상 위에 표시된다.
+> 렌더 스테이트: 불투명 상태 객체(DepthStencil/Blend/Rasterizer)로 파이프라인 동작을 제어.
+
+### 핵심 개념 — Z-Buffer 알고리즘
+
+```
+각 픽셀마다 깊이 값(0.0~1.0)을 저장하는 float 버퍼.
+
+for each pixel (x, y):
+    z_new = 보간된 삼각형 Z값
+    z_old = depth_buffer[y * width + x]
+
+    if (z_new < z_old):        ← D3D11_COMPARISON_LESS
+        color_buffer[pixel] = 새 색상
+        depth_buffer[pixel] = z_new
+    else:
+        skip (이미 더 가까운 물체가 있음)
+```
+
+깊이 보간은 barycentric 좌표로 수행:
+```c
+float z = (w0 * v0.pos[2] + w1 * v1.pos[2] + w2 * v2.pos[2]) / sum;
+```
+
+### 핵심 개념 — 렌더 스테이트 객체
+
+D3D11은 "불변 상태 객체(immutable state object)" 패턴을 사용:
+
+```
+CreateDepthStencilState(&desc) → pDSState    ← 생성 시 설정 확정
+OMSetDepthStencilState(pDSState)              ← 바인딩만 (설정 변경 없음)
+```
+
+| 상태 객체 | 제어 항목 |
+|-----------|----------|
+| DepthStencilState | 깊이 테스트 on/off, 비교 함수, 깊이 쓰기 마스크 |
+| BlendState | 알파 블렌딩, 소스/대상 블렌드 팩터 |
+| RasterizerState | 와이어프레임/솔리드, 컬링 모드, 감기 순서 |
+
+### 핵심 개념 — 백페이스 컬링
+
+삼각형의 면적 부호로 앞/뒷면 판별:
+```c
+float area = edge_func(v0, v1, v2);
+/* FrontCounterClockwise=FALSE (기본값): area > 0 → 뒷면 */
+
+if (cull_mode == CULL_BACK && is_backface)
+    return;  /* 뒷면 삼각형 건너뛰기 */
+```
+
+### 구현 — 새 핸들 오프셋
+
+| 핸들 종류 | 오프셋 | 용도 |
+|-----------|--------|------|
+| DX_STATE | 0x57000 | DepthStencil/Blend/Rasterizer 상태 |
+
+### 구현 — d3d11_types.h 추가 타입
+
+```c
+/* 비교 함수 */
+typedef enum { D3D11_COMPARISON_LESS = 2, D3D11_COMPARISON_ALWAYS = 8 } D3D11_COMPARISON_FUNC;
+
+/* 깊이 스텐실 설명 */
+typedef struct {
+    BOOL DepthEnable;
+    D3D11_DEPTH_WRITE_MASK DepthWriteMask;
+    D3D11_COMPARISON_FUNC DepthFunc;
+    /* ... stencil 필드 ... */
+} D3D11_DEPTH_STENCIL_DESC;
+
+/* 래스터라이저 설명 */
+typedef struct {
+    D3D11_FILL_MODE FillMode;
+    D3D11_CULL_MODE CullMode;
+    BOOL FrontCounterClockwise;
+    /* ... */
+} D3D11_RASTERIZER_DESC;
+```
+
+### 구현 — rasterize_triangle 확장
+
+래스터라이저 파라미터가 많아져 `struct raster_params`로 묶음:
+
+```c
+struct raster_params {
+    uint32_t *pixels;
+    float *depth;         /* 깊이 버퍼 */
+    int width, height;
+    int depth_enable;     /* 깊이 테스트 on/off */
+    int depth_func;       /* LESS, ALWAYS 등 */
+    int depth_write;      /* 깊이 쓰기 마스크 */
+    int cull_mode;        /* NONE, BACK, FRONT */
+    int front_ccw;
+    /* ... SRV, Sampler 등 */
+};
+```
+
+---
+
+## Class 38: 텍스처 매핑 + Shader Resource View
+
+> 텍스처: 삼각형 표면에 이미지를 입히는 기능. UV 좌표로 텍셀(texel)을 샘플링한다.
+> SRV(Shader Resource View): 텍스처를 셰이더 슬롯에 바인딩하는 메커니즘.
+> Sampler: 텍셀 필터링(POINT/LINEAR)과 주소 모드(WRAP/CLAMP)를 제어.
+
+### 핵심 개념 — UV 좌표와 텍스처 매핑
+
+```
+텍스처 좌표계:          화면 좌표계:
+(0,0)─────(1,0)       NDC (-1,+1)─(+1,+1)
+  │ 텍스처  │              │  화면   │
+  │ 이미지  │              │  내용   │
+(0,1)─────(1,1)        (-1,-1)─(+1,-1)
+```
+
+각 버텍스가 UV 좌표를 가지며, 래스터라이저가 barycentric으로 보간:
+```c
+float u = (w0 * v0.u + w1 * v1.u + w2 * v2.u) / sum;
+float v = (w0 * v0.v + w1 * v1.v + w2 * v2.v) / sum;
+```
+
+### 핵심 개념 — 텍스처 샘플링
+
+```c
+static uint32_t sample_texture(const struct raster_params *rp,
+                               float u, float v)
+{
+    /* 주소 모드 적용 */
+    u = clamp(u, 0.0f, 1.0f);  /* CLAMP 모드 */
+    v = clamp(v, 0.0f, 1.0f);
+
+    /* UV → 텍셀 좌표 (POINT 필터: 가장 가까운 텍셀) */
+    int tx = (int)(u * (tex_w - 1) + 0.5f);
+    int ty = (int)(v * (tex_h - 1) + 0.5f);
+
+    return texture_pixels[ty * tex_w + tx];
+}
+```
+
+| 필터 | 설명 |
+|------|------|
+| POINT | 가장 가까운 텍셀 1개 (픽셀화된 외관) |
+| LINEAR | 인접 4개 텍셀 가중 평균 (부드러운 외관) |
+
+| 주소 모드 | 설명 |
+|-----------|------|
+| CLAMP | UV가 [0,1] 범위를 벗어나면 가장자리 텍셀 |
+| WRAP | UV가 범위를 벗어나면 반복 (타일링) |
+| MIRROR | UV가 범위를 벗어나면 미러링 |
+
+### 핵심 개념 — 텍스처 × 버텍스 컬러 Modulation
+
+텍스처 색상과 버텍스 색상을 곱하여 최종 색상 결정:
+```c
+final_color = texture_color * vertex_color
+```
+
+- WHITE(1,1,1) 버텍스 × 텍스처 = 텍스처 색 그대로
+- RED(1,0,0) 텍스처 × GREEN(0,1,0) 버텍스 = BLACK(0,0,0)
+
+### 구현 — sw_vertex 확장
+
+```c
+struct sw_vertex {
+    float pos[4], color[4];
+    float texcoord[2];    /* UV 좌표 */
+    int has_texcoord;     /* TEXCOORD 시맨틱 존재 여부 */
+};
+```
+
+### 구현 — 새 핸들 오프셋 + 테이블
+
+| 핸들 종류 | 오프셋 | 용도 |
+|-----------|--------|------|
+| DX_SAMPLER | 0x58000 | SamplerState |
+
+```c
+#define MAX_D3D_SAMPLERS 32
+struct d3d_sampler { int active; D3D11_SAMPLER_DESC desc; };
+static struct d3d_sampler sampler_table[MAX_D3D_SAMPLERS];
+```
+
+### 구현 — context 확장
+
+```c
+int ps_srv_idx[8];      /* PS SRV 슬롯 → view_table 인덱스 */
+int ps_sampler_idx[8];  /* PS Sampler 슬롯 → sampler_table 인덱스 */
+```
+
+### 구현 — 주요 함수
+
+| 함수 | 설명 |
+|------|------|
+| `dev_CreateShaderResourceView` | SRV 생성 (텍스처 → 뷰) |
+| `dev_CreateSamplerState` | 샘플러 상태 생성 |
+| `ctx_PSSetShaderResources` | PS SRV 슬롯 바인딩 |
+| `ctx_PSSetSamplers` | PS 샘플러 슬롯 바인딩 |
+| `sample_texture` (내부) | UV → 텍셀 샘플링 |
+
+SRV/Sampler가 미바인딩이면 기존 버텍스 컬러만 사용하여 하위 호환성 보장.
+
+---
+
+## Class 39: DXBC 바이트코드 파서 + CPU 인터프리터
+
+> DXBC: DirectX 셰이더 컴파일러(fxc.exe)가 생성하는 바이트코드 컨테이너 포맷.
+> 지금까지 `CreateVertexShader`/`CreatePixelShader`에서 바이트코드를 저장만 하고 무시했다.
+> 이 클래스에서 DXBC 컨테이너를 파싱하고 SM4 명령어를 CPU에서 해석 실행한다.
+
+### 핵심 개념 — DXBC 컨테이너
+
+```
+DXBC 파일 구조:
+┌─────────────────────────────────────────┐
+│ "DXBC" 매직 (4바이트)                    │
+│ MD5 체크섬 (16바이트)                     │
+│ 버전 = 1 (4바이트)                        │
+│ 전체 크기 (4바이트)                       │
+│ 청크 개수 N (4바이트)                     │
+│ 청크 오프셋 배열 [N] (4바이트 × N)        │
+├─────────────────────────────────────────┤
+│ 청크 0: ISGN (입력 시그니처)              │
+│   ├ 엘리먼트 수                          │
+│   └ { 이름, 레지스터, 마스크, 시스템값 }  │
+├─────────────────────────────────────────┤
+│ 청크 1: OSGN (출력 시그니처)              │
+│   └ (ISGN과 동일 포맷)                   │
+├─────────────────────────────────────────┤
+│ 청크 2: SHDR (셰이더 바이트코드)          │
+│   ├ 버전 토큰: type(VS/PS) + major.minor │
+│   ├ 토큰 수 (DWORD 단위)                 │
+│   └ 명령어 스트림 (SM4 토큰들)            │
+└─────────────────────────────────────────┘
+```
+
+청크 태그 식별:
+| 태그 | 매직 (hex) | 의미 |
+|------|-----------|------|
+| ISGN | 0x4E475349 | Input Signature |
+| OSGN | 0x4E47534F | Output Signature |
+| SHDR | 0x52444853 | Shader Bytecode |
+
+### 핵심 개념 — SM4 명령어 포맷
+
+```
+명령어 토큰 (opcode token):
+┌────────────────────────────────────────┐
+│ Bit [10:0]  = opcode (mov=54, add=0)  │
+│ Bit [23:11] = (가변)                   │
+│ Bit [30:24] = 명령어 길이 (DWORD 수)   │
+│ Bit [31]    = 확장 비트                 │
+└────────────────────────────────────────┘
+
+오퍼랜드 토큰 (operand token):
+┌────────────────────────────────────────┐
+│ Bit [1:0]   = 컴포넌트 수 (2=float4)  │
+│ Bit [3:2]   = 선택 모드               │
+│               0=mask, 1=swizzle        │
+│ Bit [7:4]   = 마스크/스위즐 하위       │
+│ Bit [11:8]  = 스위즐 상위              │
+│ Bit [19:12] = 오퍼랜드 타입            │
+│ Bit [21:20] = 인덱스 차원 (0D~3D)     │
+│ Bit [31]    = 확장                     │
+└────────────────────────────────────────┘
+```
+
+### 핵심 개념 — SM4 오퍼랜드 타입
+
+| 타입 | 값 | 인코딩 예시 | 설명 |
+|------|----|------------|------|
+| TEMP | 0 | r0, r1, ... | 임시 레지스터 |
+| INPUT | 1 | v0, v1, ... | 입력 (VB 데이터) |
+| OUTPUT | 2 | o0, o1, ... | 출력 (다음 스테이지로) |
+| IMM32 | 4 | l(1.0, 0.0, ...) | 즉시값 상수 |
+| CB | 8 | cb0[0], cb0[1] | Constant Buffer (2D 인덱스: 버퍼, 오프셋) |
+
+오퍼랜드 토큰 인코딩:
+```
+v0.xyzw (swizzle, 소스): 0x00101E46 + index 0
+o0.xyzw (mask, 대상):    0x001020F2 + index 0
+cb0[0].xyzw:             0x00208E46 + buffer=0, offset=0
+l(4-comp immediate):     0x00004E46 + float×4
+```
+
+### 핵심 개념 — 지원 SM4 명령어
+
+| 명령 | opcode | 포맷 | 설명 |
+|------|--------|------|------|
+| add | 0 | dst, src1, src2 | 컴포넌트별 덧셈 |
+| dp3 | 16 | dst, src1, src2 | 3성분 내적 |
+| dp4 | 17 | dst, src1, src2 | 4성분 내적 |
+| mad | 50 | dst, a, b, c | a×b+c |
+| mov | 54 | dst, src | 레지스터 복사 |
+| mul | 56 | dst, src1, src2 | 컴포넌트별 곱셈 |
+| ret | 62 | (없음) | 셰이더 종료 |
+
+선언문 (opcode ≥ 88)은 실행하지 않고 길이만큼 건너뛴다.
+
+### 핵심 개념 — 셰이더 VM
+
+```c
+struct shader_vm {
+    float temps[32][4];     /* 임시 레지스터 r0~r31 */
+    float inputs[8][4];     /* 입력 v0~v7 (VB 데이터에서 로드) */
+    float outputs[8][4];    /* 출력 o0~o7 (다음 스테이지로 전달) */
+    const float *cb[4];     /* Constant Buffer 포인터 */
+    int cb_size[4];         /* CB 바이트 크기 */
+};
+```
+
+실행 흐름:
+```
+1. inputs[] ← VB 데이터 (v0=POSITION, v1=COLOR, v2=TEXCOORD)
+2. cb[] ← 바인딩된 Constant Buffer 데이터
+3. shader_vm_execute() — SM4 토큰 순회 + 명령어 해석
+4. outputs[] → 다음 스테이지 (o0=SV_Position, o1=COLOR)
+```
+
+### 구현 — 새 파일
+
+| 파일 | 내용 | 규모 |
+|------|------|------|
+| `wcl/src/dlls/d3d11/dxbc.h` | 파서/VM 선언, SM4 상수 | ~87행 |
+| `wcl/src/dlls/d3d11/dxbc.c` | DXBC 파서 + SM4 인터프리터 | ~446행 |
+
+### 구현 — dxbc.c 핵심 함수
+
+| 함수 | 설명 |
+|------|------|
+| `parse_signature()` | ISGN/OSGN 청크 → 시맨틱 이름, 레지스터 번호, 마스크 추출 |
+| `dxbc_parse()` | DXBC 컨테이너 파싱 → ISGN/OSGN/SHDR 청크 탐색, DCL_TEMPS 스캔 |
+| `read_operand()` | SM4 소스 오퍼랜드 디코딩 (TEMP/INPUT/OUTPUT/IMM32/CB + swizzle 적용) |
+| `decode_dest()` | SM4 대상 오퍼랜드 디코딩 (쓰기 타겟 + 마스크) |
+| `write_masked()` | 컴포넌트 마스크 적용 쓰기 |
+| `shader_vm_execute()` | 메인 명령어 루프 (선언 스킵 → MOV/ADD/MUL/MAD/DP3/DP4/RET 실행) |
+
+### 구현 — d3d11.c 통합
+
+`struct d3d_shader`에 `struct dxbc_info dxbc` 필드 추가:
+```c
+struct d3d_shader {
+    int active;
+    int type;               /* 0=VS, 1=PS */
+    void *bytecode;
+    size_t bytecode_size;
+    struct dxbc_info dxbc;  /* 파싱된 DXBC 정보 */
+};
+```
+
+`CreateVertexShader`/`CreatePixelShader`에서 자동 파싱:
+```c
+/* 바이트코드 저장 후 DXBC 파싱 시도 */
+dxbc_parse(bytecode, size, &shader_table[idx].dxbc);
+/* 파싱 실패 시 dxbc.valid = 0 → 기존 고정 함수 fallback */
+```
+
+### 구현 — VS VM 경로 (ctx_Draw / ctx_DrawIndexed)
+
+```c
+int use_vs_vm = 0;
+if (c->vs_idx >= 0 && shader_table[c->vs_idx].dxbc.valid)
+    use_vs_vm = 1;
+
+for (각 버텍스) {
+    if (use_vs_vm) {
+        /* === VM 경로 === */
+        struct shader_vm vm = {0};
+        vm.inputs[0] = position;     /* v0 */
+        vm.inputs[1] = color;        /* v1 */
+        vm.inputs[2] = texcoord;     /* v2 */
+        /* CB 바인딩 */
+        for (ci = 0; ci < 4; ci++)
+            if (cb_bound) vm.cb[ci] = cb_data;
+
+        shader_vm_execute(&vm, vs_dxbc);
+
+        /* o0 = SV_Position (perspective divide) */
+        tri[j].pos = vm.outputs[0] / w;
+        /* o1 = COLOR */
+        tri[j].color = vm.outputs[1];
+    } else {
+        /* === 고정 함수 fallback === */
+        /* MVP 행렬 적용 (기존 코드) */
+    }
+}
+```
+
+### 구현 — PS VM 경로 (rasterize_triangle)
+
+```c
+if (ps_dxbc && ps_dxbc->valid) {
+    /* 보간된 색상/좌표를 PS 입력으로 설정 */
+    struct shader_vm ps_vm = {0};
+    ps_vm.inputs[0] = interpolated_color;
+    /* PS CB 바인딩 */
+    shader_vm_execute(&ps_vm, ps_dxbc);
+    /* o0 = SV_Target (최종 픽셀 색상) */
+    pixel_color = ps_vm.outputs[0];
+} else {
+    /* 기존 고정 함수: 보간 색상 + 텍스처 modulation */
+}
+```
+
+### 테스트 — DXBC blob 구축
+
+테스트에서 SM4 바이트코드를 직접 인코딩하여 DXBC blob 생성:
+
+**Pass-through VS:**
+```c
+unsigned int vs_passthru_blob[] = {
+    /* DXBC header */
+    0x43425844, 0,0,0,0, 1, 148, 1, 36,
+    /* SHDR chunk */
+    0x52444853, 104,
+    0x00010040, 26,                         /* VS 4.0, 26 tokens */
+    0x0300005F, 0x001010F2, 0x00000000,     /* dcl_input v0 */
+    0x0300005F, 0x001010F2, 0x00000001,     /* dcl_input v1 */
+    0x04000067, 0x001020F2, 0, 1,           /* dcl_output_siv o0 pos */
+    0x03000065, 0x001020F2, 0x00000001,     /* dcl_output o1 */
+    0x05000036, 0x001020F2, 0, 0x00101E46, 0,  /* mov o0, v0 */
+    0x05000036, 0x001020F2, 1, 0x00101E46, 1,  /* mov o1, v1 */
+    0x0100003E                              /* ret */
+};
+```
+
+**Magenta PS (단색 출력):**
+```c
+unsigned int ps_magenta_blob[] = {
+    0x43425844, 0,0,0,0, 1, 100, 1, 36,
+    0x52444853, 56,
+    0x00000040, 14,                         /* PS 4.0, 14 tokens */
+    0x03000065, 0x001020F2, 0,              /* dcl_output o0 */
+    0x08000036, 0x001020F2, 0,              /* mov o0, l(...) */
+    0x00004E46, 0x3F800000, 0, 0x3F800000, 0x3F800000,  /* imm(1,0,1,1) */
+    0x0100003E                              /* ret */
+};
+```
+
+### 테스트 결과
+
+```
+=== DirectX 11 Test ===
+
+[1]  CreateDXGIFactory... OK
+[2]  EnumAdapters(0)... OK
+[3]  GetDesc... OK (CITC...)
+[4]  D3D11CreateDeviceAndSwapChain... OK (FL=0x0000B000)
+[5]  GetBuffer + CreateRTV... OK
+[6]  ClearRTV(red) + Present... OK
+[7]  CreateBuffer(VB)... OK
+[8]  CreateVS/PS... OK
+[9]  CreateInputLayout... OK
+[10] Pipeline bind... OK
+[11] Draw(3,0)... OK
+[12] Center pixel check... OK (Present succeeded)
+[13] EnumAdapters(1) not found... OK (DXGI_ERROR_NOT_FOUND)
+[14] CreateBuffer(CB + identity)... OK
+[15] VSSetCB(identity) + Draw... OK
+[16] UpdateSubresource(scale 0.5)... OK
+[17] Translation(+0.5, 0, 0)... OK
+[18] Perspective projection... OK (no crash)
+[19] CreateTexture2D(D32) + DSV... OK
+[20] CreateDSState(LESS)... OK
+[21] Depth test (front wins)... OK
+[22] Depth test (reverse order)... OK
+[23] ClearDSV + RSState(CULL_BACK)... OK
+[24] CreateTexture2D(2x2) + SRV... OK
+[25] CreateSamplerState(CLAMP,POINT)... OK
+[26] Textured quad draw... OK
+[27] Texture*Color modulate... OK
+[28] No texture (backward compat)... OK
+[29] DXBC parse (valid VS blob)... OK
+[30] Invalid blob fallback... OK
+[31] VS VM pass-through draw... OK
+[32] VS VM + CB transform... OK
+[33] PS VM magenta output... OK
+[34] Release... OK
+
+--- Result: 34/34 PASS ---
+```
+
+회귀 테스트:
+```
+gui_test.exe: 21/21 PASS
+api_test.exe: 10/10 PASS
+hello.exe: "Hello from Windows .exe on CITC OS!" — PASS
+```
+
+### 생성한 파일
+
+| 파일 | 내용 |
+|------|------|
+| `wcl/src/dlls/d3d11/dxbc.h` | DXBC 파서/VM 선언, SM4 opcode/operand 상수 (~87행) |
+| `wcl/src/dlls/d3d11/dxbc.c` | DXBC 컨테이너 파서 + SM4 CPU 인터프리터 (~446행) |
+
+### 수정한 파일
+
+| 파일 | 변경 |
+|------|------|
+| `wcl/src/dlls/d3d11/d3d11.c` | Class 36: CB 슬롯 + UpdateSubresource + Draw MVP 적용; Class 37: state_table + 깊이 테스트 + 컬링; Class 38: sampler_table + SRV + 텍스처 샘플링; Class 39: shader_table DXBC 필드 + VS/PS VM 통합 |
+| `wcl/include/d3d11_types.h` | ~15개 새 enum/struct (비교 함수, 깊이 스텐실, 블렌드, 래스터라이저, 필터, 샘플러 등) |
+| `wcl/tests/dx_test.c` | 테스트 [14]-[33] 추가 (20개 신규, Class 36-39) |
+| `wcl/src/loader/Makefile` | dxbc.c, dxbc.h 추가 |
+
+### Phase 4 확장 완료 요약
+
+Phase 4 확장 (Class 36-39)에서 달성한 것:
+
+| 기능 | 상태 |
+|------|------|
+| Constant Buffer (VS/PS CB 슬롯 8개) | 구현 완료 |
+| MVP 3D 변환 (4×4 행렬 × 벡터, perspective divide) | 구현 완료 |
+| UpdateSubresource (USAGE_DEFAULT 데이터 복사) | 구현 완료 |
+| Z-Buffer 깊이 테스트 (D32_FLOAT, COMPARISON_LESS) | 구현 완료 |
+| 렌더 스테이트 객체 (DepthStencil/Blend/Rasterizer) | 구현 완료 |
+| 백페이스 컬링 (CULL_BACK/FRONT/NONE) | 구현 완료 |
+| 텍스처 매핑 (UV 보간, POINT 필터, CLAMP/WRAP 주소) | 구현 완료 |
+| SRV + Sampler (PS 슬롯 바인딩) | 구현 완료 |
+| 텍스처 × 버텍스 컬러 Modulation | 구현 완료 |
+| DXBC 컨테이너 파서 (ISGN/OSGN/SHDR) | 구현 완료 |
+| SM4 CPU 인터프리터 (mov/add/mul/mad/dp3/dp4/ret) | 구현 완료 |
+| VS VM (셰이더 바이트코드로 버텍스 변환) | 구현 완료 |
+| PS VM (셰이더 바이트코드로 픽셀 색상 결정) | 구현 완료 |
+| 고정 함수 fallback (유효하지 않은 DXBC 시) | 구현 완료 |
+| dx_test 34/34 PASS | 확인 완료 |
+| 기존 테스트 회귀 없음 | 확인 완료 |
+
+**Phase 4 확장 검증 완료: 소프트웨어 래스터라이저가 CB/MVP 변환, 깊이 테스트, 텍스처 매핑, DXBC 셰이더 실행을 모두 지원. 고정 함수 fallback으로 하위 호환성 유지.**
+
+### 배운 점 (Phase 4 확장)
+
+- **SM4 바이트코드는 RISC 스타일**: 명령어가 단순하고 규칙적(opcode + dest + src1 + src2). GPU가 이런 명령어를 수천 개 병렬 실행하지만, CPU에서도 동일한 의미론을 순차 실행할 수 있다
+- **DXBC 컨테이너는 청크 기반**: 매직 + 오프셋 테이블로 청크를 찾기 때문에, 순서에 의존하지 않고 필요한 청크만 파싱할 수 있다. 미지원 청크(RDEF 등)는 자연스럽게 무시된다
+- **오퍼랜드 인코딩의 핵심은 idx_dim**: 0D(즉시값), 1D(레지스터), 2D(CB — 버퍼+오프셋)로 인덱스 차원이 달라지면 뒤따르는 인덱스 토큰 수가 변한다. 이를 올바르게 파싱해야 명령어 경계가 맞다
+- **고정 함수 fallback의 가치**: DXBC 파서가 실패해도(유효하지 않은 blob) 기존 렌더링이 깨지지 않는다. 이는 점진적 구현 전략의 핵심 — 새 기능을 추가하면서도 기존 테스트가 항상 통과해야 한다
+- **VS/PS 각각 독립적으로 VM 전환 가능**: VS만 DXBC로 실행하고 PS는 고정 함수를 쓰거나, 그 반대도 가능. 이 유연성 덕분에 테스트를 한 스테이지씩 점진적으로 검증할 수 있었다
+
+## Class 40: Vulkan 로더 + 디바이스 초기화
+
+> Vulkan은 GPU를 직접 제어하는 저수준 그래픽 API.
+> D3D11 앱이 GPU 가속을 받으려면 D3D11 API 호출을 Vulkan으로 변환해야 한다.
+> 이 클래스에서는 Vulkan 라이브러리를 동적으로 로드하고, GPU 디바이스를 초기화한다.
+
+### 핵심 개념 — Vulkan 동적 로딩
+
+정적 빌드(`-static`)에서는 Vulkan 헤더/라이브러리를 직접 링크할 수 없다.
+`VULKAN=1` 플래그로 빌드 모드를 분기:
+
+```makefile
+ifdef VULKAN
+CFLAGS += -DCITC_VULKAN_ENABLED
+LDFLAGS =               # 동적 링크
+LIBS = -ldl -lpthread -lm
+else
+LDFLAGS = -static        # 정적 (QEMU용)
+LIBS = -lpthread -lm
+endif
+```
+
+Vulkan 함수는 `dlopen("libvulkan.so.1")` + `dlsym()`으로 런타임 해석:
+
+```c
+void *lib = dlopen("libvulkan.so.1", RTLD_LAZY);
+PFN_vkCreateInstance = dlsym(lib, "vkCreateInstance");
+PFN_vkCreateDevice   = dlsym(lib, "vkCreateDevice");
+/* ... 총 ~30개 함수 포인터 ... */
+```
+
+### 핵심 개념 — SDK 없이 Vulkan 타입 정의
+
+Vulkan SDK 헤더 없이, 필요한 타입/상수를 `vk_backend.h`에 자체 정의:
+
+```c
+/* Opaque handle — 포인터 크기의 불투명 값 */
+typedef void *VkInstance;
+typedef void *VkDevice;
+typedef void *VkPhysicalDevice;
+typedef void *VkQueue;
+typedef void *VkCommandPool;
+typedef void *VkCommandBuffer;
+
+/* 필요한 상수만 직접 정의 */
+#define VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO    1
+#define VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO      3
+#define VK_FORMAT_R8G8B8A8_UNORM                 37
+#define VK_FORMAT_D32_SFLOAT                     126
+```
+
+### 핵심 개념 — Vulkan 초기화 흐름
+
+```
+1. dlopen("libvulkan.so.1")
+2. dlsym() → ~30개 함수 포인터 해석
+3. vkCreateInstance() → VkInstance
+4. vkEnumeratePhysicalDevices() → GPU 목록
+5. vkGetPhysicalDeviceQueueFamilyProperties() → 그래픽 큐 탐색
+6. vkCreateDevice() → VkDevice + VkQueue
+7. vkCreateCommandPool() → VkCommandPool
+```
+
+### 구현 — 새 파일
+
+| 파일 | 내용 | 규모 |
+|------|------|------|
+| `wcl/src/dlls/d3d11/vk_backend.h` | Vulkan 타입/상수/함수 포인터/구조체 | ~350행 |
+| `wcl/src/dlls/d3d11/vk_backend.c` | dlopen + Instance/Device 초기화 | ~400행 |
+
+### 구현 — vk_backend 구조체
+
+```c
+struct vk_backend {
+    void *vulkan_lib;           /* dlopen 핸들 */
+    VkInstance instance;
+    VkPhysicalDevice phys_dev;
+    VkDevice device;
+    VkQueue gfx_queue;
+    uint32_t gfx_family;
+    VkCommandPool cmd_pool;
+    VkPhysicalDeviceMemoryProperties mem_props;
+
+    /* 함수 포인터 (~30개) */
+    PFN_vkCreateInstance CreateInstance;
+    PFN_vkCreateDevice CreateDevice;
+    PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
+    /* ... */
+};
+```
+
+### 구현 — 메모리 타입 탐색
+
+```c
+uint32_t vk_find_memory_type(struct vk_backend *vk,
+                             uint32_t type_filter,
+                             VkMemoryPropertyFlags props)
+{
+    for (uint32_t i = 0; i < vk->mem_props.memoryTypeCount; i++) {
+        if ((type_filter & (1 << i)) &&
+            (vk->mem_props.memoryTypes[i].propertyFlags & props) == props)
+            return i;
+    }
+    return UINT32_MAX; /* 실패 */
+}
+```
+
+## Class 41: Vulkan 렌더 타깃 + Clear/Present 통합
+
+> Vulkan에서 오프스크린 이미지를 만들고, ClearRenderTargetView와 Present를 GPU 경로로 연결.
+> 기존 CDP Present 경로를 재사용하기 위해 GPU → CPU readback 방식 사용.
+
+### 핵심 개념 — GPU → CPU Readback
+
+```
+기존 (SW):  CPU rasterize → pixels[] → memcpy → CDP commit
+Vulkan:     GPU render → VkImage → vkCmdCopyImageToBuffer
+            → staging buffer → memcpy → pixels[] → CDP commit
+```
+
+Vulkan 렌더링 결과를 CPU로 읽어오는 이유:
+- WSI(Window System Integration) 직접 연결은 복잡
+- 기존 CDP 프레임 전송 경로를 재사용
+- SW/GPU 경로 전환이 투명
+
+### 핵심 개념 — 렌더 타깃 구조
+
+```c
+struct vk_render_target {
+    VkImage color_image;
+    VkImageView color_view;
+    VkDeviceMemory color_memory;
+
+    VkImage depth_image;         /* D32_SFLOAT */
+    VkImageView depth_view;
+    VkDeviceMemory depth_memory;
+    int has_depth;
+
+    VkRenderPass render_pass;    /* Color + Depth 어태치먼트 */
+    VkFramebuffer framebuffer;
+    uint32_t width, height;
+};
+```
+
+렌더 패스 생성:
+```
+Color attachment: R8G8B8A8_UNORM, LOAD_OP_CLEAR, STORE_OP_STORE
+Depth attachment: D32_SFLOAT, LOAD_OP_CLEAR, STORE_OP_DONT_CARE
+Subpass: color attachment 0 + depth attachment
+```
+
+### 구현 — d3d11.c 분기
+
+```c
+static int use_vulkan;                /* GPU 경로 활성? */
+static struct vk_backend g_vk;        /* Vulkan 디바이스 */
+static struct vk_render_target g_vk_rt; /* 렌더 타깃 */
+
+/* D3D11CreateDevice에서: */
+#ifdef CITC_VULKAN_ENABLED
+if (vk_backend_init(&g_vk) == 0) {
+    vk_create_render_target(&g_vk, &g_vk_rt, width, height);
+    use_vulkan = 1;
+}
+#endif
+
+/* ClearRenderTargetView에서: */
+if (use_vulkan)
+    vk_clear_color(&g_vk, &g_vk_rt, color);
+else
+    /* SW clear */
+
+/* Present에서: */
+if (use_vulkan)
+    vk_readback_pixels(&g_vk, &g_vk_rt, pixels, stride);
+```
+
+## Class 42: Vulkan Draw 파이프라인 (GPU Hello Triangle)
+
+> GPU에서 삼각형을 래스터라이즈. 하드코딩된 SPIR-V 셰이더로 시작.
+> VkBuffer(VB) + VkPipeline + VkCommandBuffer 녹화 + Submit.
+
+### 핵심 개념 — SPIR-V 하드코딩
+
+외부 셰이더 컴파일러 없이, `uint32_t[]` 배열로 SPIR-V 바이너리 직접 작성:
+
+```c
+/* Pass-through VS: position → gl_Position, color → output */
+static const uint32_t g_vs_spirv[] = {
+    0x07230203, /* SPIR-V magic */
+    0x00010000, /* version 1.0 */
+    /* ... OpCapability, OpMemoryModel, OpEntryPoint ... */
+    /* ... type declarations, variable declarations ... */
+    /* ... OpLoad, OpStore for position/color ... */
+};
+```
+
+### 핵심 개념 — Vulkan 그래픽 파이프라인
+
+```
+VkShaderModule (VS) ─┐
+VkShaderModule (PS) ─┤
+Vertex Input State ──┤
+Input Assembly ──────┤
+Viewport/Scissor ────┼─→ VkGraphicsPipeline
+Rasterizer State ────┤
+Color Blend State ───┤
+Pipeline Layout ─────┘
+```
+
+### 구현 — 새 파일
+
+| 파일 | 내용 | 규모 |
+|------|------|------|
+| `wcl/src/dlls/d3d11/vk_pipeline.h` | 파이프라인 API + GPU 버퍼 + 캐시 | ~80행 |
+| `wcl/src/dlls/d3d11/vk_pipeline.c` | VB/Pipeline/Draw 구현 | ~400행 |
+
+### 구현 — vk_draw() 흐름
+
+```
+1. vk_create_buffer(VB 데이터) → VkBuffer
+2. vk_create_pipeline(VS+PS SPIR-V) → VkPipeline
+3. vkAllocateCommandBuffers → VkCommandBuffer
+4. vkBeginCommandBuffer
+5.   vkCmdBeginRenderPass (clear color+depth)
+6.   vkCmdBindPipeline
+7.   vkCmdBindVertexBuffers
+8.   vkCmdSetViewport / vkCmdSetScissor
+9.   vkCmdDraw(vertexCount)
+10.  vkCmdEndRenderPass
+11. vkEndCommandBuffer
+12. vkQueueSubmit + vkQueueWaitIdle
+```
+
+## Class 43: DXBC → SPIR-V 컴파일러
+
+> SM4 바이트코드를 SPIR-V 바이너리로 변환하는 컴파일러.
+> dxbc.c의 토큰 순회 로직과 동일한 패턴으로 SPIR-V 명령어 방출.
+
+### 핵심 개념 — SPIR-V 모듈 구조
+
+```
+SPIR-V Header: magic(0x07230203), version, generator, bound
+─────────────────────────────
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint (Vertex/Fragment)
+OpDecorate (Location, BuiltIn)
+─────────────────────────────
+Type declarations:
+  void, float, vec4, ptr(Input), ptr(Output), ptr(Uniform)
+  function type
+─────────────────────────────
+Variable declarations:
+  input variables (v0, v1, ...)
+  output variables (o0, o1, ...)
+  uniform buffer (CB)
+─────────────────────────────
+OpFunction / OpLabel
+  OpLoad, OpFAdd, OpFMul, OpDot, OpStore, ...
+OpReturn / OpFunctionEnd
+```
+
+### 핵심 개념 — SM4 → SPIR-V 매핑
+
+| SM4 명령어 | SPIR-V 명령어 | 설명 |
+|-----------|--------------|------|
+| mov dst, src | OpLoad + OpStore (+ OpVectorShuffle) | 레지스터 복사 + 스위즐 |
+| add dst, a, b | OpFAdd | 컴포넌트별 덧셈 |
+| mul dst, a, b | OpFMul | 컴포넌트별 곱셈 |
+| mad dst, a, b, c | OpFMul + OpFAdd | a×b+c |
+| dp3 dst, a, b | OpDot (vec3 추출) | 3성분 내적 |
+| dp4 dst, a, b | OpDot | 4성분 내적 |
+| ret | OpReturn | 셰이더 종료 |
+| CB 접근 | OpAccessChain + OpLoad | Uniform Buffer |
+
+### 구현 — 새 파일
+
+| 파일 | 내용 | 규모 |
+|------|------|------|
+| `wcl/src/dlls/d3d11/spirv_emit.h` | SPIR-V 매직/opcode 상수 + API | ~50행 |
+| `wcl/src/dlls/d3d11/spirv_emit.c` | DXBC→SPIR-V 변환기 | ~500행 |
+
+### 구현 — API
+
+```c
+int dxbc_to_spirv(const struct dxbc_info *dxbc,
+                  uint32_t **out_spirv,
+                  size_t *out_size);
+/* 성공 시 0, 실패 시 -1 */
+/* out_spirv는 malloc으로 할당됨 */
+```
+
+## Class 44: Vulkan 전체 파이프라인 통합
+
+> DXBC→SPIR-V 컴파일러를 Vulkan 파이프라인에 연결.
+> CreateShader에서 자동 SPIR-V 컴파일, Draw에서 컴파일된 셰이더 사용.
+> Uniform Buffer(CB)와 Depth Buffer도 Vulkan으로.
+
+### 핵심 개념 — 자동 SPIR-V 컴파일
+
+```c
+/* CreateVertexShader / CreatePixelShader에서: */
+dxbc_parse(bytecode, size, &shader->dxbc);
+if (shader->dxbc.valid)
+    dxbc_to_spirv(&shader->dxbc, &shader->spirv, &shader->spirv_size);
+/* SPIR-V 변환 실패 시 SW VM fallback */
+```
+
+### 핵심 개념 — 파이프라인 캐시
+
+동일한 VS+PS 조합이 반복 사용될 때 VkPipeline 재생성을 피함:
+
+```c
+struct vk_cached_pipeline {
+    const uint32_t *vs_spirv;   /* 키: VS SPIR-V 포인터 */
+    const uint32_t *ps_spirv;   /* 키: PS SPIR-V 포인터 */
+    int depth_test;
+    VkPipeline pipeline;
+    VkPipelineLayout layout;
+    VkDescriptorSetLayout ds_layout;
+    VkDescriptorPool ds_pool;
+};
+
+#define VK_MAX_CACHED_PIPELINES 16
+struct vk_pipeline_cache {
+    struct vk_cached_pipeline entries[VK_MAX_CACHED_PIPELINES];
+    int count;
+};
+```
+
+### 핵심 개념 — Descriptor Set (UBO 바인딩)
+
+Constant Buffer를 GPU 셰이더에 전달하는 Vulkan 메커니즘:
+
+```
+VkDescriptorSetLayout (set=0, binding=0, UNIFORM_BUFFER)
+    ↓
+VkDescriptorPool (maxSets=16)
+    ↓
+vkAllocateDescriptorSets → VkDescriptorSet
+    ↓
+vkUpdateDescriptorSets (UBO 바인딩)
+    ↓
+vkCmdBindDescriptorSets (Draw 시 바인딩)
+```
+
+### 구현 — vk_gpu_draw() 헬퍼 (~130행)
+
+```c
+static void vk_gpu_draw(ctx, vertex_count, index_count, start_vertex) {
+    /* 1. VS/PS SPIR-V 확인 */
+    /* 2. 파이프라인 캐시 조회/생성 */
+    /* 3. VB/IB/UBO GPU 버퍼 업로드 */
+    /* 4. Descriptor Set 할당 + UBO 바인딩 */
+    /* 5. GPU Draw (indexed or non-indexed) */
+}
+```
+
+### 구현 — 수정한 파일
+
+| 파일 | 변경 |
+|------|------|
+| `d3d11.c` | `struct d3d_shader`에 spirv 필드, CreateShader에서 자동 SPIR-V 컴파일, ctx_Draw/DrawIndexed에 GPU 경로 |
+| `vk_pipeline.c` | UBO + Depth + 파이프라인 캐시 + draw_indexed |
+| `vk_backend.c` | 렌더 타깃에 depth image 추가, render pass 2-attachment |
+
+### 빌드 결과
+
+```
+SW 빌드: 36/36 PASS (DXBC → SPIR-V blob 유효성 확인 테스트 [34]-[35] 추가)
+VULKAN=1 빌드: 성공
+회귀: gui_test 21/21, api_test 10/10, hello OK
+```
+
+## Class 45: DirectSound + XAudio2 (OSS 백엔드)
+
+> Windows 오디오 API 두 가지 구현:
+> DirectSound8 — 실제 PCM 오디오 출력 (OSS /dev/dsp 백엔드)
+> XAudio2 — 최소 스텁 (앱 크래시 방지)
+
+### 핵심 개념 — DirectSound COM 인터페이스
+
+```
+DirectSoundCreate8()
+  → IDirectSound8 (COM vtable)
+    → CreateSoundBuffer()
+      → IDirectSoundBuffer8 (COM vtable)
+        → Lock() / Unlock()  — 링 버퍼 접근
+        → Play() / Stop()    — 백그라운드 재생 스레드
+        → SetFormat()         — PCM 파라미터 설정
+```
+
+### 핵심 개념 — OSS 오디오 백엔드
+
+ALSA를 직접 사용하면 libasound 동적 링크가 필요하다.
+대신 OSS(Open Sound System) 호환 인터페이스 사용 — `/dev/dsp` 파일에 PCM 데이터를 write():
+
+```c
+int fd = open("/dev/dsp", O_WRONLY);
+/* 포맷 설정 (ioctl) */
+ioctl(fd, SNDCTL_DSP_SETFMT, &AFMT_S16_LE);
+ioctl(fd, SNDCTL_DSP_STEREO, &stereo);
+ioctl(fd, SNDCTL_DSP_SPEED, &sample_rate);
+/* 오디오 출력 — 그냥 write! */
+write(fd, pcm_data, size);
+```
+
+QEMU의 `-audiodev` 설정 시 사운드가 실제로 재생됨.
+`/dev/dsp`가 없으면 `/dev/null`로 fallback (무음이지만 크래시 방지).
+
+### 핵심 개념 — 재생 스레드
+
+DirectSound의 Play()는 비동기적 — 백그라운드에서 링 버퍼를 계속 읽어야 한다:
+
+```c
+static void *play_thread_func(void *arg) {
+    struct ds_buffer *b = arg;
+    int chunk = sample_rate * block_size / 50; /* ~20ms */
+
+    while (b->playing) {
+        /* 링 버퍼에서 chunk만큼 OSS로 write */
+        oss_write(b->audio_fd, b->data + b->play_cursor, chunk);
+        b->play_cursor = (b->play_cursor + chunk) % b->size;
+        usleep(20000); /* 20ms 대기 */
+    }
+}
+```
+
+### 핵심 개념 — XAudio2 최소 스텁
+
+XAudio2는 DirectSound보다 새로운 API. 많은 게임이 두 API를 모두 시도한다.
+XAudio2Create가 S_OK를 반환하면 앱이 크래시하지 않는다:
+
+```c
+XAudio2Create() → IXAudio2 (COM vtable)
+  → CreateMasteringVoice() → 스텁 (S_OK)
+  → CreateSourceVoice() → 스텁 (S_OK)
+    → SubmitSourceBuffer() → 무시 (S_OK)
+```
+
+### 구현 — 새 파일
+
+| 파일 | 내용 | 규모 |
+|------|------|------|
+| `wcl/src/dlls/dsound/dsound.c` | DirectSound8 구현 (OSS 백엔드) | ~480행 |
+| `wcl/src/dlls/dsound/dsound.h` | stub_table 선언 | ~17행 |
+| `wcl/src/dlls/xaudio2/xaudio2.c` | XAudio2 최소 스텁 | ~220행 |
+| `wcl/src/dlls/xaudio2/xaudio2.h` | stub_table 선언 | ~17행 |
+
+### 구현 — win32.h 추가 타입
+
+```c
+typedef struct {
+    uint16_t wFormatTag;
+    uint16_t nChannels;
+    uint32_t nSamplesPerSec;
+    uint32_t nAvgBytesPerSec;
+    uint16_t nBlockAlign;
+    uint16_t wBitsPerSample;
+    uint16_t cbSize;
+} WAVEFORMATEX;
+
+typedef struct {
+    DWORD dwSize;
+    DWORD dwFlags;
+    DWORD dwBufferBytes;
+    DWORD dwReserved;
+    WAVEFORMATEX *lpwfxFormat;
+    GUID guid3DAlgorithm;
+} DSBUFFERDESC;
+```
+
+### 구현 — DLL 엔트리 등록
+
+```c
+/* dsound_stub_table */
+{ "dsound.dll", "DirectSoundCreate8", ... },
+{ "dsound.dll", "DirectSoundCreate", ... },
+{ "dsound.dll", "DirectSoundEnumerateA", ... },
+
+/* xaudio2_stub_table */
+{ "xaudio2_7.dll", "XAudio2Create", ... },
+{ "xaudio2_9.dll", "XAudio2Create", ... },
+```
+
+## Class 46: XInput (evdev 게임패드)
+
+> xinput1_3.dll / xinput1_4.dll의 XInputGetState, XInputSetState 구현.
+> Linux evdev 장치에서 게임패드 상태를 읽어 XInput 구조체로 변환.
+
+### 핵심 개념 — evdev 장치 스캔
+
+```
+/dev/input/event0 ~ event15 순회
+  → ioctl(EVIOCGBIT(0, ...)) — 이벤트 타입 비트맵
+  → EV_ABS 비트 있는가?
+    → ioctl(EVIOCGBIT(EV_ABS, ...)) — ABS 축 비트맵
+    → ABS_X + ABS_Y 있으면 → 게임패드!
+  → ioctl(EVIOCGABS(ABS_X)) — 축 범위 (min, max)
+  → ioctl(EVIOCGNAME(...)) — 장치 이름
+```
+
+### 핵심 개념 — evdev → XInput 매핑
+
+| evdev | XInput | 설명 |
+|-------|--------|------|
+| ABS_X, ABS_Y | sThumbLX, sThumbLY | 왼쪽 스틱 (Y 반전) |
+| ABS_RX, ABS_RY | sThumbRX, sThumbRY | 오른쪽 스틱 (Y 반전) |
+| ABS_Z | bLeftTrigger | 왼쪽 트리거 (0~255) |
+| ABS_RZ | bRightTrigger | 오른쪽 트리거 (0~255) |
+| ABS_HAT0X, ABS_HAT0Y | DPAD_LEFT/RIGHT/UP/DOWN | D-Pad |
+| BTN_SOUTH | XINPUT_GAMEPAD_A | A 버튼 |
+| BTN_EAST | XINPUT_GAMEPAD_B | B 버튼 |
+| BTN_NORTH | XINPUT_GAMEPAD_Y | Y 버튼 |
+| BTN_WEST | XINPUT_GAMEPAD_X | X 버튼 |
+| BTN_TL/TR | LEFT/RIGHT_SHOULDER | 범퍼 |
+| BTN_THUMBL/R | LEFT/RIGHT_THUMB | 스틱 클릭 |
+
+### 핵심 개념 — 축 정규화
+
+evdev 축은 장치마다 범위가 다르다 (예: 0~255, -32768~32767, 0~1023).
+XInput은 고정 범위를 사용하므로 정규화 필요:
+
+```c
+/* 스틱: -32768 ~ 32767 */
+int16_t normalize_axis(int32_t val, int32_t min, int32_t max) {
+    int64_t range = max - min;
+    return (int16_t)((val - min) * 65535 / range - 32768);
+}
+
+/* 트리거: 0 ~ 255 */
+uint8_t normalize_trigger(int32_t val, int32_t min, int32_t max) {
+    return (uint8_t)((val - min) * 255 / (max - min));
+}
+```
+
+### 핵심 개념 — Force Feedback (진동)
+
+```c
+/* XInputSetState → EV_FF 이벤트 */
+struct ff_effect eff = { .type = FF_RUMBLE, .id = -1 };
+ioctl(fd, EVIOCSFF, &eff); /* 효과 등록 */
+
+struct input_event play = {
+    .type = EV_FF,
+    .code = eff.id,
+    .value = 1  /* 1=시작, 0=중지 */
+};
+write(fd, &play, sizeof(play));
+```
+
+### 구현 — 새 파일
+
+| 파일 | 내용 | 규모 |
+|------|------|------|
+| `wcl/src/dlls/xinput/xinput.c` | XInput 구현 (evdev 백엔드) | ~340행 |
+| `wcl/src/dlls/xinput/xinput.h` | stub_table 선언 | ~17행 |
+
+### 구현 — DLL 엔트리 등록
+
+```c
+/* 3개 DLL 버전 모두 지원 */
+{ "xinput1_3.dll", "XInputGetState", ... },
+{ "xinput1_4.dll", "XInputGetState", ... },
+{ "xinput9_1_0.dll", "XInputGetState", ... },
+/* + XInputSetState, XInputGetCapabilities, XInputEnable */
+```
+
+## Class 47: 실제 D3D11 앱 실행 테스트 (회전하는 큐브)
+
+> Phase 4 최종 통합 검증.
+> D3D11 전체 파이프라인 + DXBC MVP dp4 + DrawIndexed + 깊이 버퍼 + DirectSound.
+> 실제 3D 애플리케이션에 가까운 구조로 모든 컴포넌트 통합 테스트.
+
+### 핵심 개념 — DrawIndexed 첫 검증
+
+dx_test.exe는 `Draw(3,0)`으로 삼각형만 그렸다.
+cube_test.exe는 **DrawIndexed(36, 0, 0)** 로 인덱스 버퍼를 통한 큐브 렌더링:
+
+```
+8 vertices × (float4 pos + float4 color) = 256 bytes
+36 indices × uint16 = 72 bytes
+→ 6 faces × 2 triangles = 12 triangles
+```
+
+### 핵심 개념 — DXBC dp4 MVP 변환
+
+기존 dx_test의 `add o0, v0, cb0[0]`은 단순 오프셋 변환이었다.
+cube_test의 VS는 **dp4 (dot product 4)** 로 진짜 4×4 행렬 변환:
+
+```hlsl
+dp4 o0.x, v0, cb0[0]   // 첫 번째 행 × 정점
+dp4 o0.y, v0, cb0[1]   // 두 번째 행 × 정점
+dp4 o0.z, v0, cb0[2]   // 세 번째 행 × 정점
+dp4 o0.w, v0, cb0[3]   // 네 번째 행 × 정점
+mov o1, v1              // 색상 패스스루
+```
+
+DXBC 인코딩:
+```c
+/* dp4 o0.x, v0, cb0[0] — 8 tokens */
+0x08000011,              /* opcode=0x11(dp4), length=8 */
+0x00102012, 0x00000000,  /* dest: o0.x (mask=0x1) */
+0x00101E46, 0x00000000,  /* src0: v0.xyzw */
+0x00208E46, 0x00000000, 0x00000000,  /* src1: cb0[0].xyzw */
+```
+
+컴포넌트별 쓰기 마스크:
+| 대상 | 마스크 | 인코딩 |
+|------|--------|--------|
+| o0.x | 0x1 | 0x00102012 |
+| o0.y | 0x2 | 0x00102022 |
+| o0.z | 0x4 | 0x00102042 |
+| o0.w | 0x8 | 0x00102082 |
+
+### 핵심 개념 — Vertex Color PS (보간 색상)
+
+```hlsl
+dcl_input v1       // 래스터라이저에서 보간된 COLOR
+dcl_output o0      // SV_Target
+mov o0, v1         // 그대로 출력
+```
+
+### 핵심 개념 — Y축 회전 애니메이션
+
+프레임마다 회전 행렬을 갱신하여 CB에 업로드:
+
+```c
+float angle = frame * 0.2094f; /* ~12° per frame */
+float mvp[16];
+mat4_rotate_y(mvp, angle);
+ctx->UpdateSubresource(pCB, 0, NULL, mvp, 64, 0);
+```
+
+30프레임 × ClearRTV + ClearDSV + DrawIndexed + Present = 완전한 렌더 루프.
+
+### 테스트 결과
+
+```
+=== 3D Cube Integration Test ===
+
+[1]  D3D11 Device+SwapChain... OK
+[2]  RTV + DSV... OK
+[3]  Cube VB(8) + IB(36)... OK
+[4]  DXBC VS(dp4) + PS(color)... OK
+[5]  Layout + CB + Pipeline... OK
+[6]  DrawIndexed(36) identity... OK
+[7]  Center pixel check... OK (Present succeeded)
+[8]  Rotation 30 frames... OK (30 frames)
+[9]  DirectSoundCreate8... OK
+[10] Release... OK
+
+--- Result: 10/10 PASS ---
+```
+
+회귀 테스트:
+```
+dx_test.exe: 36/36 PASS
+gui_test.exe: 21/21 PASS
+api_test.exe: 10/10 PASS
+hello.exe: OK
+```
+
+### 생성한 파일
+
+| 파일 | 내용 |
+|------|------|
+| `wcl/tests/cube_test.c` | 3D 큐브 통합 테스트 (~450행) |
+
+### Phase 4 완성 + Phase 5 진입 요약
+
+Class 40-47에서 달성한 것:
+
+| 기능 | 상태 |
+|------|------|
+| Vulkan 동적 로딩 (dlopen, 30+ 함수 포인터) | 구현 완료 |
+| Vulkan Instance/Device/Queue 초기화 | 구현 완료 |
+| Vulkan 오프스크린 렌더 타깃 (Color+Depth) | 구현 완료 |
+| GPU ClearRenderTargetView + Readback Present | 구현 완료 |
+| VkPipeline + VkBuffer (VB/IB/UBO) | 구현 완료 |
+| 하드코딩 SPIR-V 셰이더 (Hello Triangle) | 구현 완료 |
+| DXBC → SPIR-V 컴파일러 (6개 명령어) | 구현 완료 |
+| 파이프라인 캐시 (VS+PS 키) | 구현 완료 |
+| Descriptor Set (Uniform Buffer 바인딩) | 구현 완료 |
+| 자동 SPIR-V 컴파일 (CreateShader 시) | 구현 완료 |
+| DirectSound8 (IDirectSound8 + IDirectSoundBuffer8, OSS) | 구현 완료 |
+| XAudio2 최소 스텁 (xaudio2_7/9.dll) | 구현 완료 |
+| XInput (evdev, 최대 4패드, FF 진동) | 구현 완료 |
+| 3D 큐브 통합 테스트 (DrawIndexed + dp4 MVP + 회전) | 구현 완료 |
+| cube_test 10/10 PASS | 확인 완료 |
+| dx_test 36/36 PASS (회귀 없음) | 확인 완료 |
+| VULKAN=1 빌드 성공 | 확인 완료 |
+
+### 수정한 파일 (Class 40-47 전체)
+
+| 파일 | 변경 |
+|------|------|
+| `wcl/src/dlls/d3d11/d3d11.c` | use_vulkan 분기, SPIR-V 자동 컴파일, vk_gpu_draw() 헬퍼 |
+| `wcl/src/dlls/dxgi/dxgi.c` | Present GPU readback |
+| `wcl/include/win32.h` | WAVEFORMATEX, DSBUFFERDESC, XInput 타입/상수 |
+| `wcl/src/loader/citcrun.c` | dsound/xaudio2/xinput stub_table 등록 |
+| `wcl/src/loader/Makefile` | VULKAN 조건부 빌드 + 새 DLL 소스 추가 |
+| `wcl/tests/Makefile` | cube_test.exe 빌드 규칙 |
+
+### 생성한 파일 (Class 40-47 전체)
+
+| 파일 | Class | 내용 |
+|------|-------|------|
+| `wcl/src/dlls/d3d11/vk_backend.h` | 40 | Vulkan 타입/상수/함수 포인터 |
+| `wcl/src/dlls/d3d11/vk_backend.c` | 40-41 | Vulkan 초기화 + 렌더 타깃 + Clear + Readback |
+| `wcl/src/dlls/d3d11/vk_pipeline.h` | 42-44 | 파이프라인 캐시 + GPU 버퍼 API |
+| `wcl/src/dlls/d3d11/vk_pipeline.c` | 42-44 | VB/Pipeline/UBO/Depth/Draw |
+| `wcl/src/dlls/d3d11/spirv_emit.h` | 43 | SPIR-V 컴파일러 API |
+| `wcl/src/dlls/d3d11/spirv_emit.c` | 43 | DXBC→SPIR-V 변환기 |
+| `wcl/src/dlls/dsound/dsound.c` | 45 | DirectSound8 (OSS 백엔드) |
+| `wcl/src/dlls/dsound/dsound.h` | 45 | 선언 |
+| `wcl/src/dlls/xaudio2/xaudio2.c` | 45 | XAudio2 스텁 |
+| `wcl/src/dlls/xaudio2/xaudio2.h` | 45 | 선언 |
+| `wcl/src/dlls/xinput/xinput.c` | 46 | XInput (evdev 게임패드) |
+| `wcl/src/dlls/xinput/xinput.h` | 46 | 선언 |
+| `wcl/tests/cube_test.c` | 47 | 3D 큐브 통합 테스트 |
+
+### 배운 점 (Phase 4 완성)
+
+- **Vulkan을 SDK 없이 사용할 수 있다**: Vulkan은 함수 포인터 기반 API라서, 타입과 상수를 직접 정의하면 헤더 없이도 동작한다. 이는 특수한 빌드 환경(정적 링크, 크로스 컴파일)에서 유용하다
+- **SPIR-V는 직접 생성 가능한 포맷이다**: SPIR-V 바이너리는 `uint32_t[]` 배열이고, 각 명령어의 인코딩이 규칙적이라서 외부 라이브러리 없이도 구축 가능하다. SM4의 6개 명령어만 매핑해도 기본적인 셰이더가 동작한다
+- **파이프라인 캐시의 가치**: Vulkan에서 VkPipeline 생성은 비싸다(수십 ms). VS+PS SPIR-V 포인터를 키로 캐시하면 동일 셰이더 조합에서 재사용이 가능하다. 16개면 대부분의 간단한 앱에 충분하다
+- **OSS는 가장 단순한 오디오 백엔드**: `/dev/dsp`에 PCM 데이터를 write()하는 것만으로 오디오 출력이 가능하다. ALSA보다 훨씬 간단하고, 정적 링크에서도 동작한다
+- **evdev는 입력 장치의 공통 인터페이스**: 키보드, 마우스, 게임패드 모두 `/dev/input/event*`를 통해 접근하고, `ioctl(EVIOCGBIT)`으로 장치 종류를 구분한다. 축 범위가 장치마다 다르므로 정규화가 필수적이다
+- **DrawIndexed는 3D 렌더링의 기본**: 공유 정점 + 인덱스 버퍼 방식은 메모리를 절약하고 GPU 캐시 효율을 높인다. 큐브의 8정점 × 36인덱스 패턴은 3D 그래픽의 가장 기본적인 사용 사례이다
+- **dp4로 4×4 행렬 변환**: `dp4 o0.x, v0, cb0[0]` × 4회 = 정점의 행렬 변환. 이것이 3D 그래픽에서 회전/이동/투영이 작동하는 근본적인 원리이다
+
+---
+
+## Phase 4 버그 수정 + 테스트 강화
+
+### 발견된 버그
+
+#### 버그 1: PS VM 입력 레지스터 매핑 오류
+
+**증상:** cube_test [7] 중앙 픽셀이 검정(0x00000000). 큐브가 올바르게 렌더링되지 않음.
+
+**원인:** `d3d11.c` 래스터라이저에서 PS VM을 실행할 때, 보간된 색상을 항상 `ps_vm.inputs[0]`에만 넣었음. 그러나 cube_test PS 셰이더는 `v1`(inputs[1])에서 색상을 읽도록 작성됨.
+
+D3D11에서 VS output 레지스터 번호와 PS input 레지스터 번호가 대응:
+
+- VS `o0` = SV_Position → PS에서 직접 읽지 않음
+- VS `o1` = COLOR → PS `v1`로 전달되어야 함
+
+**수정:** `d3d11.c:1372` — PS VM 입력 설정 시 `inputs[0]`과 `inputs[1]` 양쪽에 보간된 색상을 넣도록 수정:
+
+```c
+/* v0 = 색상 (기존 PS 호환) */
+ps_vm.inputs[0][0] = cr;
+ps_vm.inputs[0][1] = cg;
+ps_vm.inputs[0][2] = cb_c;
+ps_vm.inputs[0][3] = 1.0f;
+/* v1 = 색상 (VS o1→PS v1 매핑) */
+ps_vm.inputs[1][0] = cr;
+ps_vm.inputs[1][1] = cg;
+ps_vm.inputs[1][2] = cb_c;
+ps_vm.inputs[1][3] = 1.0f;
+```
+
+**교훈:** SM4 셰이더에서 레지스터 번호는 의미론적(semantic) 매핑을 통해 결정된다. 래스터라이저는 VS 출력 시그니처와 PS 입력 시그니처를 매칭하여 올바른 레지스터에 데이터를 전달해야 한다. 현재는 `inputs[0]`과 `inputs[1]` 양쪽에 넣는 방식으로 우회했지만, 향후 시그니처 기반 자동 매핑이 필요하다.
+
+#### 버그 2: Map()에서 SwapChain 백버퍼 접근 불가
+
+**증상:** dx_test [12] "Map failed" — `Map(pBackBuffer, ...)` 호출 시 E_INVALIDARG 반환.
+
+**원인:** `GetBuffer(pSwapChain, 0, ..., &pBackBuffer)`가 SwapChain 포인터 자체를 반환(`sc_GetBuffer`에서 `*ppSurface = This`). 이 포인터는 D3D11 리소스 핸들이 아니므로 `handle_to_resource_idx()`가 -1을 반환.
+
+`CreateRenderTargetView(pBackBuffer)` 호출 시 SwapChain으로 인식하여 리소스 테이블에 등록하고 `sc->resource_idx`에 인덱스를 저장하지만, `Map()`에는 이 fallback이 없었음.
+
+**수정:**
+
+1. `dxgi.c`에 `dxgi_get_swapchain_resource_idx()` 함수 추가 — SwapChain에 등록된 리소스 인덱스 반환
+2. `d3d11.c:1084` `ctx_Map()`에서 `handle_to_resource_idx()` 실패 시 `dxgi_get_swapchain_resource_idx()`로 fallback:
+
+```c
+int idx = handle_to_resource_idx(pResource);
+if (idx < 0)
+    idx = dxgi_get_swapchain_resource_idx(pResource);
+if (idx < 0) return E_INVALIDARG;
+```
+
+**교훈:** WCL에서 SwapChain의 GetBuffer()는 SwapChain 자체를 반환하는 특수한 구현이다. 이 포인터를 받는 모든 API(CreateRTV, Map 등)에서 SwapChain 인식 fallback이 필요하다.
+
+### 테스트 강화
+
+기존에 "Present succeeded"만 확인하던 테스트를 실제 픽셀 값 검증으로 강화:
+
+| 테스트 | 이전 검증 | 이후 검증 |
+|--------|-----------|-----------|
+| dx_test [12] | Present 성공 여부 | Map→픽셀 읽기 (`0x00545655` = RGB 보간) |
+| cube_test [7] | Present 성공 여부 | Map→중앙 픽셀 (`0x007F027E` ≠ 배경색) |
+| cube_test [8] | 30프레임 Present 성공 | 프레임 0/15 픽셀 비교 (회전으로 색상 변화 확인) |
+
+**구현 방법:**
+
+1. `D3D11_MAPPED_SUBRESOURCE` 타입과 `D3D11_MAP_READ` 상수를 테스트 프로그램에 추가
+2. `Map(pBackBuffer)` → 픽셀 배열 접근 → `RowPitch/4`로 행 폭 계산
+3. XRGB8888 포맷: `(pixel >> 16) & 0xFF` = R, `(pixel >> 8) & 0xFF` = G, `pixel & 0xFF` = B
+4. 배경색(0x00000033)과 다르고 RGB 합이 0보다 크면 렌더링 성공
+
+### 버그 수정에서 수정된 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/src/dlls/d3d11/d3d11.c` | PS VM inputs[1] 추가, ctx_Map SwapChain fallback |
+| `wcl/src/dlls/dxgi/dxgi.c` | `dxgi_get_swapchain_resource_idx()` 함수 추가 |
+| `wcl/src/dlls/dxgi/dxgi.h` | 새 함수 선언 추가 |
+| `wcl/tests/dx_test.c` | [12] 실제 픽셀 검증 + D3D11_MAPPED_SUBRESOURCE 타입 |
+| `wcl/tests/cube_test.c` | \[7\]\[8\] 실제 픽셀 검증 + D3D11_MAPPED_SUBRESOURCE 타입 |
+
+---
+
+## Class 48: Win32 Threading & Synchronization
+
+### 목표
+
+CreateThread/WaitForSingleObject/Event/Mutex/CriticalSection/Interlocked/TLS를
+pthread 기반으로 구현하여 멀티스레드 Windows 앱 실행 가능하게 만든다.
+
+### 핵심 배운 점
+
+1. **ms_abi 스레드 콜백**: Windows 앱의 스레드 함수는 `__stdcall`(ms_abi).
+   `pthread_create`는 sysv_abi wrapper를 받고, wrapper 안에서 ms_abi 콜백 호출.
+
+2. **Object Manager 핸들 타입**: `OB_THREAD/OB_EVENT/OB_MUTEX` 타입 추가.
+   `ob_create_handle_ex(type, extra)` — extra 포인터(구조체)를 핸들에 연결.
+   `WaitForSingleObject`가 핸들 타입별로 대기 로직 분기.
+
+3. **Event 구현**: `pthread_cond + pthread_mutex + signaled 플래그`.
+   manual reset: `pthread_cond_broadcast`, auto reset: `pthread_cond_signal` + 플래그 자동 클리어.
+
+4. **Mutex 구현**: `PTHREAD_MUTEX_RECURSIVE` — Windows Mutex는 재귀적 잠금 허용.
+
+5. **Critical Section**: 내부적으로 `pthread_mutex_t*`를 `cs->LockSemaphore`에 저장.
+   Windows CRITICAL_SECTION 구조체 레이아웃을 재현하여 앱이 스택 선언해도 안전.
+
+6. **Interlocked 함수**: MinGW에서는 DLL 임포트가 아닌 컴파일러 인트린식.
+   `__sync_add_and_fetch`, `__sync_val_compare_and_swap` 등 GCC builtins 사용.
+   테스트 파일에서도 `__declspec(dllimport)` 대신 인라인 정의 필요.
+
+7. **TLS**: `pthread_key_create/getspecific/setspecific` 래핑.
+   최대 64슬롯, 전역 배열로 인덱스 관리.
+
+8. **WaitForMultipleObjects**: WaitAll은 순차 대기, WaitAny는 폴링 방식.
+   완전한 구현(커널 대기 큐)이 아닌 단순화된 버전이지만 대부분의 앱에 충분.
+
+### 구현한 함수 (24개)
+
+| 카테고리 | 함수 |
+|----------|------|
+| 스레드 | CreateThread, ExitThread, GetExitCodeThread |
+| Event | CreateEventA, SetEvent, ResetEvent |
+| Mutex | CreateMutexA, ReleaseMutex |
+| 대기 | WaitForSingleObject, WaitForMultipleObjects |
+| CS | InitializeCriticalSection, Enter/Leave/DeleteCriticalSection |
+| Interlocked | Increment, Decrement, Exchange, CompareExchange |
+| Sleep | Sleep |
+| TLS | TlsAlloc, TlsGetValue, TlsSetValue, TlsFree |
+
+### 테스트 결과
+
+thread_test.exe 17/17 PASS:
+
+- \[1\] CreateThread + WaitForSingleObject (값 설정 확인)
+- \[2\] Event (manual reset) + 스레드 시그널
+- \[3\] Event (auto reset) — 한 번만 시그널 소비
+- \[4\] Mutex — 두 스레드 카운터 정확히 2000
+- \[5\] CriticalSection — 동일 패턴
+- \[6\] WaitForMultipleObjects(WaitAll)
+- \[7\] InterlockedIncrement — 20000 (2스레드×10000)
+- \[8\] TLS — 스레드별 독립 값
+- \[9\] Sleep — 크래시 없음
+- \[10\] GetExitCodeThread — 종료 코드 77 확인
+
+회귀: hello OK, api_test 10/10, gui_test 21/21, dx_test 36/36, cube_test 10/10, VULKAN=1 빌드 OK.
+
+### 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/src/ntemu/object_manager.h` | `OB_THREAD` 타입 추가, `ob_create_handle_ex()` 선언 |
+| `wcl/src/ntemu/object_manager.c` | `ob_create_handle_ex()` 구현 |
+| `wcl/include/win32.h` | CRITICAL_SECTION, LPTHREAD_START_ROUTINE, SECURITY_ATTRIBUTES |
+| `wcl/src/dlls/kernel32/kernel32.c` | 스레딩/동기화 24개 함수 + stub_table 등록 |
+| `wcl/tests/thread_test.c` | **신규** — 스레딩 테스트 17항목 |
+| `wcl/tests/Makefile` | thread_test.exe 빌드 규칙 |
+
+---
+
+## Class 49: advapi32 (Registry & Security)
+
+### 핵심 개념
+
+advapi32.dll은 Windows의 "Advanced API" 라이브러리로, 주로 3가지 영역을 담당:
+- **레지스트리**: 시스템 설정 저장소 (RegCreateKey, RegQueryValue, ...)
+- **보안**: 사용자 인증, 토큰 관리 (GetUserName, OpenProcessToken, ...)
+- **서비스**: 백그라운드 서비스 관리 (OpenSCManager, CreateService, ...)
+
+### 학습 포인트
+
+1. **레지스트리 열거 (RegEnumKeyExA / RegEnumValueA)**:
+   파일 시스템 기반 레지스트리에서 `opendir() + readdir()` 로 하위 키(디렉토리)와 값(파일)을 구분.
+   `d_type`이 신뢰할 수 없으므로 `stat()` 후 `S_ISDIR/S_ISREG` 판별.
+   인덱스 기반 열거 — 매번 전체 스캔 O(n²)이지만 레지스트리 키 수가 적어 충분.
+
+2. **레지스트리 삭제**:
+   - RegDeleteKeyA → `rmdir()` (빈 디렉토리만 삭제 가능 — Windows 동작과 일치)
+   - RegDeleteValueA → `unlink()` (값 파일 삭제)
+
+3. **보안 스텁 전략**:
+   대부분의 Windows 앱이 `GetUserNameA`, `OpenProcessToken` 등을 호출.
+   실제 보안 모델 구현은 불필요하므로, 크래시 방지 목적의 스텁:
+   - GetUserNameA → "citcuser" 반환
+   - OpenProcessToken → 더미 핸들(0xDEAD0001) 반환
+   - GetTokenInformation → FALSE (최소 구현)
+
+4. **서비스 스텁 전략**:
+   앱이 서비스 설치를 시도할 때 안전하게 거부:
+   - OpenSCManagerA → 더미 핸들 반환 (앱이 null check 통과)
+   - OpenServiceA → NULL (서비스 없음)
+   - CreateServiceA → NULL (권한 거부)
+
+5. **GCC format-truncation 경고**:
+   `snprintf(buf, 1024, "%s/%s", path, name)` 에서 path(1023) + name(255) > 1024.
+   해결: `"%.768s/%.254s"` 처럼 필드 폭 제한으로 컴파일러 경고 해소.
+
+### 구현한 함수 (14개 추가, 총 19개)
+
+| 카테고리 | 함수 | 설명 |
+|----------|------|------|
+| 레지스트리 열거 | RegEnumKeyExA | opendir + readdir (디렉토리만) |
+| 레지스트리 열거 | RegEnumValueA | opendir + readdir (파일만) |
+| 레지스트리 삭제 | RegDeleteKeyA | rmdir (빈 디렉토리만) |
+| 레지스트리 삭제 | RegDeleteValueA | unlink |
+| 보안 | GetUserNameA | "citcuser" 반환 |
+| 보안 | OpenProcessToken | 더미 토큰 핸들 |
+| 보안 | GetTokenInformation | 스텁 (FALSE) |
+| 보안 | LookupAccountSidA | "citcuser"/"CITC" |
+| 서비스 | OpenSCManagerA | 더미 핸들 |
+| 서비스 | OpenServiceA | NULL (없음) |
+| 서비스 | CreateServiceA | NULL (거부) |
+| 서비스 | StartServiceA | FALSE |
+| 서비스 | CloseServiceHandle | no-op |
+
+기존 5개: RegOpenKeyExA, RegCreateKeyExA, RegCloseKey, RegQueryValueExA, RegSetValueExA
+
+### 테스트 결과
+
+reg_test.exe 16/16 PASS:
+
+- \[1-6\] 기존 CRUD 테스트 (Class 24)
+- \[7\] RegCreateKeyExA(Sub1) — 서브키 생성
+- \[8\] RegEnumKeyExA(0) — "Sub1" 열거
+- \[9\] RegEnumKeyExA(99) → ERROR_NO_MORE_ITEMS
+- \[10\] RegEnumValueA(0) — 값 이름 + 타입 열거
+- \[11-12\] RegDeleteValueA — TestStr, TestDword 삭제
+- \[13\] RegDeleteKeyA("Sub1") — 서브키 삭제
+- \[14\] RegCloseKey
+- \[15\] RegDeleteKeyA(CitcTest) — 부모 키 삭제 (빈 상태)
+- \[16\] GetUserNameA → "citcuser"
+
+회귀: hello OK, api_test 10/10, thread_test 17/17, gui_test 21/21, dx_test 36/36, cube_test 10/10, VULKAN=1 빌드 OK.
+
+### 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/src/ntemu/registry.h` | reg_delete_key/value, reg_enum_key/value 선언 |
+| `wcl/src/ntemu/registry.c` | 열거/삭제 함수 + 보안/서비스 스텁 14개 + stub_table 확장 |
+| `wcl/include/win32.h` | ERROR_SERVICE_*, TOKEN_*, SC_MANAGER_* 상수 |
+| `wcl/tests/reg_test.c` | Class 49 테스트 10개 추가 (총 16개) |
+
+---
+
+## Class 50: COM Runtime (ole32)
+
+### 핵심 개념
+
+COM (Component Object Model)은 Windows의 객체 시스템으로, 언어 독립적 인터페이스를 통한 객체 생성/통신 프레임워크.
+핵심 흐름: `CoInitializeEx → CoCreateInstance(CLSID, IID) → 객체 사용 → Release → CoUninitialize`.
+
+### 학습 포인트
+
+1. **CoCreateInstance 내부 구조**:
+   실제 Windows: SCM(Service Control Manager) → 클래스 레지스트리(HKCR) → DLL 로드 → IClassFactory.
+   우리 구현: 정적 배열 `com_registry[]`에서 CLSID를 memcmp로 검색 → 생성 함수 직접 호출.
+   DirectSound8 등 기존 DLL의 생성 함수를 stub_table에서 동적으로 찾아 호출.
+
+2. **COM 초기화 모델 (STA vs MTA)**:
+   실제 Windows: STA(Single-Threaded Apartment)는 메시지 루프 필요, MTA는 자유 스레딩.
+   우리 구현: `pthread_key_t`로 per-thread 초기화 플래그만 관리. Apartment 구분 없음.
+   `CoInitializeEx` 재호출 시 `S_FALSE` 반환 (성공이지만 이미 초기화).
+
+3. **CoTaskMem — COM 메모리 할당**:
+   COM 인터페이스 간 메모리 전달 규약. 호출자와 호출 대상이 같은 힙을 사용해야 해제 가능.
+   우리 구현: `malloc/realloc/free` 직접 래핑 (단일 프로세스이므로 힙 불일치 없음).
+
+4. **GUID 처리**:
+   GUID는 128비트(16바이트) 구조체. `{Data1-Data2-Data3-Data4[0..1]-Data4[2..7]}` 형식.
+   `IsEqualGUID` = `memcmp(a, b, 16)`.
+   `StringFromGUID2`는 UTF-16LE 출력 — ASCII→UTF-16 변환 (하위 바이트만 사용).
+   `CLSIDFromString`은 UTF-16 입력 → ASCII 변환 후 파싱.
+
+5. **외부 DLL 생성 함수 연동**:
+   ole32.c에서 dsound.c의 `DirectSoundCreate8`를 호출하려면 `extern` 참조.
+   `dsound_stub_table[]`에서 함수 포인터를 런타임에 검색하는 간접 호출 패턴.
+
+### 구현한 함수 (11개)
+
+| 카테고리 | 함수 | 설명 |
+|----------|------|------|
+| 초기화 | CoInitialize | CoInitializeEx 래퍼 |
+| 초기화 | CoInitializeEx | per-thread 플래그 설정 |
+| 초기화 | CoUninitialize | 플래그 해제 |
+| 생성 | CoCreateInstance | CLSID 검색 → 생성 함수 호출 |
+| 생성 | CoGetClassObject | 스텁 (E_NOINTERFACE) |
+| 메모리 | CoTaskMemAlloc | malloc 래퍼 |
+| 메모리 | CoTaskMemRealloc | realloc 래퍼 |
+| 메모리 | CoTaskMemFree | free 래퍼 |
+| GUID | IsEqualGUID | memcmp |
+| GUID | StringFromGUID2 | GUID → UTF-16 문자열 |
+| GUID | CLSIDFromString | UTF-16 문자열 → GUID |
+
+### 테스트 결과
+
+com_test.exe 8/8 PASS:
+
+- \[1\] CoInitializeEx(COINIT_MULTITHREADED) → S_OK
+- \[2\] CoInitializeEx 재호출 → S_FALSE
+- \[3\] IsEqualGUID(동일) → TRUE
+- \[4\] IsEqualGUID(다른) → FALSE
+- \[5\] CoTaskMemAlloc(256) + 쓰기 + Free
+- \[6\] CoCreateInstance(CLSID_DirectSound8) → IDirectSound8 획득
+- \[7\] CoCreateInstance(가짜 CLSID) → 정상 거부
+- \[8\] CoUninitialize
+
+회귀: hello OK, api_test 10/10, reg_test 16/16, thread_test 17/17, gui_test 21/21, dx_test 36/36, cube_test 10/10, VULKAN=1 빌드 OK.
+
+### 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/src/dlls/ole32/ole32.c` | **신규** — COM 런타임 11개 함수 |
+| `wcl/src/dlls/ole32/ole32.h` | **신규** — 선언 |
+| `wcl/src/loader/citcrun.c` | ole32.h include + ole32_stub_table 등록 |
+| `wcl/src/loader/Makefile` | ole32.c 소스 추가 |
+| `wcl/tests/com_test.c` | **신규** — COM 테스트 8개 |
+| `wcl/tests/Makefile` | com_test.exe 빌드 규칙 |
+
+---
+
+## Class 51: ws2_32 (Winsock2 Networking)
+
+### 핵심 개념
+
+Winsock2는 Windows의 소켓 API. POSIX 소켓과 거의 동일하나 3가지 주요 차이:
+1. **초기화**: `WSAStartup()` 필수 (Linux: 불필요)
+2. **에러 처리**: `WSAGetLastError()` (Linux: `errno`)
+3. **소켓 닫기**: `closesocket()` (Linux: `close()`)
+나머지 `socket/bind/listen/accept/connect/send/recv`는 이름과 시그니처 동일.
+
+### 학습 포인트
+
+1. **SOCKET 타입 차이**: Windows `SOCKET = UINT_PTR` (unsigned), POSIX `fd = int` (signed).
+   `INVALID_SOCKET`은 Windows에서 `~0` (UINT_PTR max), POSIX에서 `-1`.
+   우리 구현: 내부적으로 `int fd`를 `uintptr_t`로 캐스팅. 앱은 `== INVALID_SOCKET` 비교만 하므로 호환.
+
+2. **errno → WSA 에러코드 변환**: POSIX errno 값을 Winsock 에러코드(10000번대)로 매핑.
+   `EWOULDBLOCK → WSAEWOULDBLOCK(10035)`, `ECONNREFUSED → WSAECONNREFUSED(10061)` 등.
+   `last_wsa_error` 전역 변수로 스레드 안전하지 않음 (실제 Windows는 per-thread).
+
+3. **정적 빌드와 DNS**: `getaddrinfo/gethostbyname`은 glibc NSS를 사용하므로 정적 링크 시 경고.
+   실행 시에는 동작하나, NSS 설정에 따라 느릴 수 있음.
+
+4. **테스트 패턴 — 로컬 루프백 에코**:
+   서버 스레드: `bind(127.0.0.1:19876) → listen → accept → recv → send(echo)`.
+   클라이언트: `connect → send("HELLO") → recv → "HELLO" 확인`.
+   UDP: `sendto("UDP!") → recvfrom → 확인`.
+
+### 구현한 함수 (31개)
+
+| 카테고리 | 함수 |
+|----------|------|
+| 초기화 | WSAStartup, WSACleanup, WSAGetLastError, WSASetLastError |
+| 소켓 | socket, closesocket |
+| 연결 | bind, listen, accept, connect |
+| 전송 | send, recv, sendto, recvfrom |
+| 멀티플렉싱 | select, ioctlsocket |
+| 옵션 | setsockopt, getsockopt |
+| DNS | getaddrinfo, freeaddrinfo, gethostname, gethostbyname |
+| 바이트 오더 | htons, htonl, ntohs, ntohl, inet_addr, inet_ntoa |
+| 기타 | getpeername, getsockname, shutdown |
+
+### 테스트 결과
+
+net_test.exe 8/8 PASS:
+
+- \[1\] WSAStartup(2.2) → version 2.2 확인
+- \[2\] socket(AF_INET, SOCK_STREAM) → 유효한 SOCKET
+- \[3\] TCP 서버 bind+listen (스레드) → OK
+- \[4\] TCP 에코: send("HELLO") → recv("HELLO")
+- \[5\] UDP sendto("UDP!") → recvfrom("UDP!")
+- \[6\] getaddrinfo("localhost") → 성공
+- \[7\] gethostname → 호스트명 반환
+- \[8\] WSACleanup
+
+회귀: hello OK, api_test 10/10, reg_test 16/16, thread_test 17/17, com_test 8/8, VULKAN=1 빌드 OK.
+
+### 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/src/dlls/ws2_32/ws2_32.c` | **신규** — Winsock2 31개 함수 |
+| `wcl/src/dlls/ws2_32/ws2_32.h` | **신규** — 선언 |
+| `wcl/src/loader/citcrun.c` | ws2_32.h include + ws2_32_stub_table 등록 |
+| `wcl/src/loader/Makefile` | ws2_32.c 소스 추가 |
+| `wcl/tests/net_test.c` | **신규** — 네트워크 테스트 8개 |
+| `wcl/tests/Makefile` | net_test.exe 빌드 규칙 |
+
+---
+
+## Class 52: kernel32 확장 (시간, 파일시스템, 시스템 정보)
+
+### 핵심 개념
+
+실제 Windows 앱이 빈번히 호출하는 kernel32 유틸리티 함수 21개 추가.
+시간 API는 게임 루프, 벤치마크에 필수. 파일 탐색은 리소스 로딩에 필수.
+시스템 정보는 앱 초기화/호환성 체크에 사용.
+
+### 시간 API
+
+**POSIX clock_gettime → Win32 시간 함수 매핑:**
+
+| Win32 함수 | POSIX 구현 | 단위 |
+|------------|-----------|------|
+| GetTickCount | clock_gettime(MONOTONIC) | ms (32-bit, wraps at ~49일) |
+| GetTickCount64 | clock_gettime(MONOTONIC) | ms (64-bit) |
+| QueryPerformanceCounter | clock_gettime(MONOTONIC) | ns |
+| QueryPerformanceFrequency | 고정 1,000,000,000 | Hz (1GHz) |
+| GetSystemTimeAsFileTime | clock_gettime(REALTIME) | FILETIME (100ns since 1601) |
+
+**FILETIME 에포크 변환:**
+```c
+// Unix epoch (1970-01-01) vs Windows FILETIME epoch (1601-01-01)
+// 차이: 11644473600초 = 116444736000000000 * 100ns
+#define FILETIME_UNIX_DIFF 116444736000000000ULL
+
+// REALTIME → FILETIME:
+uint64_t ft = (uint64_t)ts.tv_sec * 10000000ULL
+            + (uint64_t)ts.tv_nsec / 100
+            + FILETIME_UNIX_DIFF;
+```
+
+### 파일시스템 API
+
+| Win32 함수 | POSIX 매핑 | 비고 |
+|------------|-----------|------|
+| CreateDirectoryA | mkdir(path, 0755) | |
+| RemoveDirectoryA | rmdir(path) | |
+| GetTempPathA | "/tmp/" 반환 | Windows는 %TEMP% |
+| GetCurrentDirectoryA | getcwd() | |
+| SetCurrentDirectoryA | chdir() | |
+| FindFirstFileA | opendir + readdir + fnmatch | 패턴 매칭 |
+| FindNextFileA | readdir + fnmatch | |
+| FindClose | closedir + free | |
+| GetFileAttributesA | stat() → 속성 변환 | S_ISDIR → DIRECTORY |
+| GetFileType | fstat() or OB 타입 | CONSOLE→CHAR, else DISK |
+
+**FindFirstFile 내부 구조:**
+```c
+struct find_state {
+    DIR *dir;
+    char pattern[MAX_PATH];   // 파일명 패턴 (e.g., "*.exe")
+    char dirpath[MAX_PATH];   // 디렉토리 경로
+};
+
+// FindFirstFileA("C:\\temp\\*.txt", &fd)
+//  → dirpath = "C:\\temp", pattern = "*.txt"
+//  → opendir(dirpath)
+//  → readdir until fnmatch(pattern, d_name, 0) == 0
+//  → stat() for attributes + size
+//  → 핸들로 find_state 포인터 반환
+```
+
+### 시스템 정보 API
+
+| Win32 함수 | POSIX 구현 | 반환 값 |
+|------------|-----------|---------|
+| GetSystemInfo | sysconf(_SC_NPROCESSORS_ONLN) | CPU 수, 페이지 크기 등 |
+| GlobalMemoryStatusEx | sysinfo() | 물리/가용 메모리 |
+| GetVersionExA | 고정값 | Windows 10 (10.0.19041) |
+| GetComputerNameA | gethostname() | 호스트명 |
+| GetSystemDirectoryA | 고정 | "C:\\Windows\\System32" |
+| GetWindowsDirectoryA | 고정 | "C:\\Windows" |
+
+### win32.h 추가 타입
+
+```c
+typedef struct { DWORD dwLowDateTime; DWORD dwHighDateTime; } FILETIME;
+typedef union { struct { DWORD LowPart; long HighPart; }; long long QuadPart; } LARGE_INTEGER;
+
+typedef struct {
+    DWORD dwFileAttributes;
+    FILETIME ftCreationTime, ftLastAccessTime, ftLastWriteTime;
+    DWORD nFileSizeHigh, nFileSizeLow;
+    char cFileName[MAX_PATH];
+    char cAlternateFileName[14];
+} WIN32_FIND_DATAA;
+
+typedef struct { /* wProcessorArchitecture, dwPageSize, dwNumberOfProcessors, ... */ } SYSTEM_INFO;
+typedef struct { /* dwMajorVersion, dwMinorVersion, dwBuildNumber, dwPlatformId, ... */ } OSVERSIONINFOA;
+typedef struct { /* ullTotalPhys, ullAvailPhys, ... */ } MEMORYSTATUSEX;
+```
+
+### 테스트 결과
+
+api_test.exe 17/17 PASS (기존 10개 + 신규 7개):
+
+- \[11\] GetTickCount + Sleep(100) → diff=100ms
+- \[12\] QueryPerformanceCounter/Frequency → freq=1000MHz
+- \[13\] GetTempPathA → "/tmp/"
+- \[14\] CreateDirectoryA + GetFileAttributesA(DIRECTORY) + RemoveDirectoryA
+- \[15\] FindFirstFile("/tmp/*") → 11 entries
+- \[16\] GetSystemInfo → cpus=24, page=4096
+- \[17\] GetVersionExA → Windows 10.0 build 19041
+
+회귀: hello OK, reg_test 16/16, thread_test 17/17, com_test 8/8, net_test 8/8, gui_test 21/21, dx_test 36/36, cube_test 10/10, VULKAN=1 빌드 OK.
+
+### 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/src/dlls/kernel32/kernel32.c` | 21개 함수 추가 (시간 5, 파일시스템 10, 시스템정보 6) |
+| `wcl/include/win32.h` | FILETIME, LARGE_INTEGER, WIN32_FIND_DATAA, SYSTEM_INFO 등 타입 추가 |
+| `wcl/tests/api_test.c` | 테스트 7개 추가 (11-17번) |
+
+---
+
+## Class 53: D3D11 고급 기능 + Shader Cache
+
+### 핵심 개념
+
+DXBC SM4 인터프리터에 비교/분기/루프 명령어를 추가하고,
+SPIR-V 컴파일러에도 대응하는 변환을 구현.
+컴파일된 SPIR-V를 디스크에 캐시하여 재실행 시 컴파일 건너뛰기.
+
+### 추가한 SM4 명령어
+
+| 카테고리 | 명령어 | 설명 |
+|---------|--------|------|
+| 비교 | LT, GE, EQ, NE | 컴포넌트별 비교 → 0xFFFFFFFF/0x0 마스크 |
+| 수학 | MIN, MAX | 컴포넌트별 최소/최대 |
+| 조건부 | MOVC | 마스크 기반 조건부 이동 (cond ? true : false) |
+| 수학 | RSQ | 역 제곱근 (1/sqrt) |
+| 분기 | IF, ELSE, ENDIF | 조건 분기 (if_nz/if_z) |
+| 루프 | LOOP, ENDLOOP, BREAK, BREAKC | 반복 실행 + 탈출 |
+
+**SM4 비교 결과 포맷:**
+비교 결과는 float 레지스터에 저장되지만, 실제 값은 비트 패턴:
+- true: 0xFFFFFFFF (NaN as float, but SM4는 비트 마스크로 사용)
+- false: 0x00000000
+
+### CPU 인터프리터 흐름 제어
+
+**IF/ELSE/ENDIF:**
+```
+if_nz r0.x
+  → test_condition(r0.x) — 비트가 non-zero면 true
+  → false이면 scan_to_matching()으로 ELSE/ENDIF까지 스킵
+  → ELSE 도달 시 (실행 중이었으면) ENDIF까지 스킵
+```
+
+**LOOP/ENDLOOP/BREAK:**
+```
+loop
+  → loop_stack에 body 시작 위치 push
+endloop
+  → loop_stack에서 pop, body 시작으로 점프 (최대 1024회)
+break / breakc_nz
+  → loop_stack pop + scan_to_matching(ENDLOOP)으로 루프 탈출
+```
+
+`scan_to_matching()`: 네스팅을 추적하며 매칭되는 대상 opcode까지 전진.
+
+### SPIR-V 컴파일러 확장
+
+| SM4 | SPIR-V 변환 |
+|-----|------------|
+| LT | OpFOrdLessThan → bvec4, OpSelect → float mask |
+| GE | OpFOrdGreaterThanEqual → OpSelect |
+| EQ | OpFOrdEqual → OpSelect |
+| NE | OpFUnordNotEqual → OpSelect |
+| MIN | OpExtInst(GLSL.std.450, FMin) |
+| MAX | OpExtInst(GLSL.std.450, FMax) |
+| MOVC | OpFUnordNotEqual(cond, 0) → OpSelect(bool, true, false) |
+| RSQ | OpExtInst(GLSL.std.450, InverseSqrt) |
+
+**추가된 SPIR-V 타입:**
+- `%bool` (OpTypeBool) — 비교 결과
+- `%bvec4` (OpTypeVector %bool 4) — 벡터 비교 결과
+- `GLSL.std.450` 확장 임포트 (OpExtInstImport)
+
+### Shader Cache
+
+**해시 → 디스크 캐시:**
+```
+DXBC blob → FNV-1a 64-bit hash → ~/.citc/shader_cache/<hex>.spv
+
+CreateShader(blob):
+  1. shader_cache_lookup(blob) → 히트? → 캐시된 SPIR-V 반환
+  2. 미스 → dxbc_to_spirv() 컴파일
+  3. shader_cache_store(blob, spirv) → 디스크 저장
+```
+
+FNV-1a: 단순하고 빠른 해시, 충돌 위험 매우 낮음.
+blob 전체를 해시하므로 셰이더 변경 시 자동으로 재컴파일.
+
+### 테스트 결과
+
+dx_test.exe 40/40 PASS (기존 36개 + 신규 4개):
+
+- \[36\] DXBC if/else: ge + if_nz 분기 → green 출력 확인
+- \[37\] DXBC movc: lt + movc 조건부 이동 → 셰이더 생성 성공
+- \[38\] DXBC min/max: 값 클램핑 → 셰이더 생성 성공
+- \[39\] Shader cache: 동일 blob 두 번째 CreatePixelShader → 캐시 히트
+
+회귀: hello OK, api_test 17/17, reg_test 16/16, thread_test 17/17, com_test 8/8, net_test 8/8, cube_test 10/10, VULKAN=1 빌드 OK.
+
+### 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/src/dlls/d3d11/dxbc.h` | SM4 opcode 추가 (14개: LT,GE,EQ,NE,MIN,MAX,MOVC,RSQ,IF,ELSE,ENDIF,LOOP,ENDLOOP,BREAK,BREAKC) |
+| `wcl/src/dlls/d3d11/dxbc.c` | CPU 인터프리터: 비교/분기/루프 명령어 + scan_to_matching 흐름 제어 |
+| `wcl/src/dlls/d3d11/spirv_emit.h` | SPIR-V opcode 추가 (Select, 비교, ExtInst, TypeBool, GLSL.std.450) |
+| `wcl/src/dlls/d3d11/spirv_emit.c` | SPIR-V 변환: 비교→Select, MIN/MAX→ExtInst, MOVC→Select, RSQ→InverseSqrt |
+| `wcl/src/dlls/d3d11/shader_cache.c` | **신규** — FNV-1a 디스크 캐시 |
+| `wcl/src/dlls/d3d11/shader_cache.h` | **신규** — 캐시 API |
+| `wcl/src/dlls/d3d11/d3d11.c` | CreateVertex/PixelShader에 캐시 조회/저장 통합 |
+| `wcl/src/loader/Makefile` | shader_cache.c 추가 |
+| `wcl/tests/dx_test.c` | 테스트 4개 추가 (36-39번) |
+
+---
+
+## Class 54: D3D12 기초
+
+### 학습 목표
+
+DirectX 12의 명시적 커맨드 모델 구현. D3D11과 달리 앱이 직접 커맨드 리스트, 동기화(Fence), 메모리 할당을 관리.
+
+### 핵심 개념
+
+**D3D12 vs D3D11 아키텍처 차이:**
+
+| 요소 | D3D11 | D3D12 |
+|------|-------|-------|
+| 커맨드 제출 | Immediate Context (암시적) | CommandList → Close → ExecuteCommandLists |
+| 메모리 | 자동 | CreateCommittedResource (명시적 힙 지정) |
+| 동기화 | 자동 | Fence + Signal/GetCompletedValue |
+| 파이프라인 상태 | 개별 Set* 호출 | PipelineState 객체 (불변) |
+| 디스크립터 | 자동 바인딩 | DescriptorHeap + CPU/GPU Handle |
+
+**COM 포인터 풀 패턴:**
+Resource, Fence, DescriptorHeap은 복수 인스턴스가 필요한 COM 객체.
+정적 배열에 vtable 포인터를 저장하고, `&pool[idx]`를 COM 객체로 반환.
+```c
+static ID3D12ResourceVtbl *res_com[MAX_RESOURCES];
+// CreateCommittedResource:
+res_com[idx] = &res_vtbl;
+*ppResource = (void *)&res_com[idx];
+// vtable method에서 인덱스 추출:
+ptrdiff_t idx = (ID3D12ResourceVtbl **)This - res_com;
+```
+
+**Descriptor → Resource 매핑:**
+D3D12에서 RTV는 디스크립터 핸들을 통해 리소스에 접근.
+CreateRenderTargetView에서 {handle.ptr → resource_index} 매핑 저장.
+ClearRenderTargetView에서 핸들로 리소스를 역참조.
+
+**SW 커맨드 실행 모델:**
+CommandList.Close()에서 기록된 명령을 즉시 실행 (동기적).
+ExecuteCommandLists는 no-op (이미 Close에서 실행 완료).
+Fence.Signal도 즉시 값 설정 (GPU 없이 동기적).
+
+### 구현 내용
+
+**d3d12_types.h (신규, ~540행):**
+- 16개 열거형: COMMAND_LIST_TYPE, HEAP_TYPE, RESOURCE_STATES, RESOURCE_DIMENSION 등
+- 14개 구조체: COMMAND_QUEUE_DESC, HEAP_PROPERTIES, RESOURCE_DESC, VIEWPORT, RECT 등
+- 9개 COM vtable: ID3D12DeviceVtbl (40+ 슬롯), CommandQueueVtbl, CommandListVtbl (50+ 슬롯) 등
+- D3D11_types.h에서 DXGI_FORMAT, DXGI_SAMPLE_DESC 재사용
+
+**d3d12.h (신규):**
+- d3d12_stub_table extern 선언
+
+**d3d12.c (신규, ~950행):**
+- COM 포인터 풀: res_com[64], fence_com[8], dh_com[16]
+- 디스크립터 매핑: desc_map[256] (handle.ptr → resource index)
+- ID3D12Device: CreateCommandQueue, CreateCommandAllocator, CreateCommandList, CreateDescriptorHeap, CreateRootSignature, CreateCommittedResource(BUFFER/TEXTURE2D), CreateRenderTargetView, CreateFence
+- ID3D12GraphicsCommandList: ClearRenderTargetView, Close(clear 실행), Reset, DrawInstanced, ResourceBarrier(no-op)
+- ID3D12CommandQueue: ExecuteCommandLists(no-op), Signal(즉시)
+- ID3D12Fence: GetCompletedValue, Signal, SetEventOnCompletion(즉시)
+- ID3D12Resource: Map, Unmap, GetGPUVirtualAddress
+- ID3D12DescriptorHeap: GetCPU/GPUDescriptorHandleForHeapStart
+- D3D12CreateDevice, D3D12GetDebugInterface, D3D12SerializeRootSignature
+
+### 테스트 결과
+
+d3d12_test 10/10 PASS:
+- [1] D3D12CreateDevice → 성공
+- [2] CreateCommandQueue + Allocator + CommandList → 성공
+- [3] CreateDescriptorHeap(RTV) + GetCPUHandle → 유효한 핸들
+- [4] CreateCommittedResource(TEX2D 64x64) + CreateRTV → 성공
+- [5] ClearRTV(red) + Close → 픽셀 0xFFFF0000 확인
+- [6] CommandList Reset + blue clear → 0xFF0000FF 확인
+- [7] CreateCommittedResource(BUFFER 256B) + Map/Write/Unmap/Read → 데이터 일치
+- [8] CreateFence(0) + Signal(42) → GetCompletedValue == 42
+- [9] CommandQueue::Signal(fence, 100) → GetCompletedValue == 100
+- [10] Release → 정상 종료
+
+회귀: hello OK, api_test 17/17, reg_test 16/16, thread_test 17/17, gui_test 21/21, dx_test 40/40, cube_test 10/10, com_test 8/8, net_test 8/8, VULKAN=1 빌드 OK.
+
+### 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/include/d3d12_types.h` | **신규** — D3D12 열거형/구조체/COM vtable |
+| `wcl/src/dlls/d3d12/d3d12.h` | **신규** — DLL 헤더 |
+| `wcl/src/dlls/d3d12/d3d12.c` | **신규** — D3D12 최소 구현 (Device, CmdQueue, CmdList, Resource, Fence, DescHeap) |
+| `wcl/src/loader/citcrun.c` | d3d12_stub_table 등록 |
+| `wcl/src/loader/Makefile` | D3D12_DIR + d3d12.c/h 추가 |
+| `wcl/tests/d3d12_test.c` | **신규** — D3D12 테스트 10개 |
+| `wcl/tests/Makefile` | d3d12_test.exe 빌드 규칙 |
+
+---
+
+## Class 55: 통합 테스트 + 실제 앱 실행
+
+### 학습 목표
+
+Phase 5 전체 기능을 통합 검증. 멀티스레드 + 네트워킹 + COM + D3D12 + 파일시스템 + 레지스트리가 함께 동작하는 실제 앱 시나리오.
+
+### 핵심 개념
+
+#### 통합 테스트의 가치
+
+단위 테스트가 개별 API의 정확성을 검증한다면, 통합 테스트는 **API 간 상호작용**을 검증한다:
+
+- **스레드 + 네트워크**: 에코 서버 스레드 → 클라이언트 연결 → send/recv
+- **스레드 + 시간**: 워커 스레드에서 GetTickCount → 이벤트 시그널 → 메인 스레드 확인
+- **COM + DirectSound**: CoInitializeEx → CoCreateInstance(CLSID_DirectSound8)
+- **파일시스템 + 시간**: GetTempPath → CreateDirectory → FindFirstFile → RemoveDirectory
+- **D3D12 + Fence**: CreateDevice → CreateCommittedResource → Map/Write → Fence 동기화
+
+#### FindFirstFileA 루트 경로 버그
+
+`FindFirstFileA("/tmp", ...)` 호출 시, 경로 파싱에서 첫 번째 `/`를 찾아 split:
+- `slash == path_copy` (위치 0) → `*slash = '\0'` → `dirpath = ""` → `opendir("")` 실패
+
+**수정**: `slash == path_copy`인 경우 `dirpath = "/"` 처리:
+
+```c
+if (slash == path_copy) {
+    snprintf(dirpath, sizeof(dirpath), "/");
+    snprintf(pattern, sizeof(pattern), "%s", slash + 1);
+}
+```
+
+#### Winsock 소켓 옵션 상수 변환
+
+Windows와 Linux의 소켓 옵션 상수 값이 다름:
+
+| 상수 | Windows | Linux |
+|------|---------|-------|
+| SOL_SOCKET | 0xFFFF | 1 |
+| SO_REUSEADDR | 0x0004 | 2 |
+| SO_BROADCAST | 0x0020 | 6 |
+| SO_KEEPALIVE | 0x0080 | 9 |
+| SO_RCVBUF | 0x1005 | 8 |
+| SO_SNDBUF | 0x1001 | 7 |
+| TCP_NODELAY | 0x0001 | 1 (동일) |
+
+`ws2_32.c`에 `translate_sol_level()` + `translate_so_optname()` 변환 함수 추가.
+`setsockopt`과 `getsockopt` 모두에 적용.
+
+#### 에코 서버 패턴
+
+TCP 에코 서버를 별도 스레드로 실행하는 통합 테스트 패턴:
+
+```
+[서버 스레드]                    [메인 스레드]
+  socket + SO_REUSEADDR           Sleep 대기 루프
+  bind(19999) + listen            server_ready 확인
+  server_ready = 1                socket + connect(19999)
+  accept → recv → send → close   send("PING") → recv("PING")
+```
+
+`SO_REUSEADDR` 없으면 TIME_WAIT 상태의 포트에 재바인드 실패 → 테스트 불안정.
+
+### 테스트 결과
+
+```
+=== App Integration Test (Class 55) ===
+
+--- Scenario 1: Multithreaded + Time ---
+  [1] Worker thread + Event + GetTickCount ... PASS
+  [2] Sleep(50) + GetTickCount delta ... PASS
+  [3] GetVersionExA(10.x) + GetSystemInfo(cpus>=1) ... PASS
+
+--- Scenario 2: Network + Registry ---
+  [4] TCP echo (threaded server + PING) ... PASS
+  [5] Registry write + read + cleanup ... PASS
+  [6] WSACleanup ... PASS
+
+--- Scenario 3: COM Runtime ---
+  [7] CoInitializeEx(COINIT_MULTITHREADED) ... PASS
+  [8] CoCreateInstance(CLSID_DirectSound8) ... PASS
+  [9] CoUninitialize ... PASS
+
+--- Scenario 4: Filesystem ---
+  [10] GetTempPath + CreateDir + RemoveDir ... PASS
+  [11] FindFirstFileA(/tmp/*) ... PASS
+  [12] FindFirstFileA(/tmp) attributes ... PASS
+
+--- Scenario 5: D3D12 + Fence ---
+  [13] D3D12CreateDevice ... PASS
+  [14] D3D12 Buffer Map/Write/Read ... PASS
+  [15] D3D12 Fence(0) -> Signal(999) -> 999 ... PASS
+
+--- app_test: 15/15 PASS ---
+```
+
+### 전체 회귀 테스트
+
+```
+=== CITC OS WCL — Full Test Suite ===
+  PASS: hello
+  PASS: api_test      (17/17)
+  PASS: reg_test      (16/16)
+  PASS: gui_test      (21/21)
+  PASS: dx_test       (40/40)
+  PASS: cube_test     (10/10)
+  PASS: thread_test   (17/17)
+  PASS: com_test      (8/8)
+  PASS: net_test      (8/8)
+  PASS: d3d12_test    (10/10)
+  PASS: app_test      (15/15)
+=== Results: 11/11 passed, 0 failed ===
+ALL PASS
+```
+
+### Phase 5 최종 달성 현황
+
+| 항목 | Phase 4 끝 | Phase 5 끝 |
+|------|-----------|-----------|
+| Win32 API 함수 수 | ~120 | ~180+ |
+| DLL 수 | 9 | 12 (+ole32, ws2_32, d3d12) |
+| 스레딩 | 불가 | CreateThread + Event/Mutex/CS/TLS |
+| 네트워킹 | 불가 | TCP/UDP 소켓 (Winsock2) |
+| COM 런타임 | DX 전용 | 범용 CoCreateInstance |
+| DirectX | D3D11 | D3D11 + D3D12 기초 |
+| 셰이더 명령어 | 6개 | ~16개 (분기/루프/텍스처 포함) |
+| 레지스트리 | 읽기 전용 | CRUD + 열거 + 삭제 |
+| 보안 API | 없음 | GetUserName + Token 스텁 |
+| 시간 API | 없음 | GetTickCount + QPC |
+| 파일 탐색 | 없음 | FindFirstFile/FindNextFile |
+| 테스트 프로그램 | 7개 | 12개 + 자동화 스크립트 |
+| 테스트 항목 수 | ~88 | ~163 |
+
+### 겪었던 문제
+
+1. **FindFirstFileA 루트 경로 파싱**: `/tmp` → `dirpath=""` → `opendir("")` 실패. `slash == path_copy` 특수 처리로 해결.
+2. **Winsock 소켓 옵션 상수 불일치**: `SOL_SOCKET=0xFFFF`(Win) vs `1`(Linux). 변환 테이블 추가.
+3. **에코 서버 포트 재바인드 실패**: `SO_REUSEADDR` 미설정 시 TIME_WAIT 포트에 bind 실패. setsockopt 추가로 해결.
+
+### 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/tests/app_test.c` | **신규** — 종합 통합 테스트 15개 (5 시나리오) |
+| `wcl/tests/run_all_tests.sh` | **신규** — 전체 회귀 테스트 스크립트 |
+| `wcl/tests/Makefile` | app_test.exe 빌드 규칙 추가 |
+| `wcl/src/dlls/kernel32/kernel32.c` | FindFirstFileA 루트 경로 파싱 수정 |
+| `wcl/src/dlls/ws2_32/ws2_32.c` | 소켓 옵션 상수 변환 (translate_sol_level/translate_so_optname) |
+
+---
+
+## Class 56: 오디오 서버 (citcaudio)
+
+Phase 6 시작 — OS 인프라 강화
+
+**파일:** `audio/src/citcaudio.c`, `audio/src/citcaudio_proto.h`, `audio/src/citcaudio_client.h`, `audio/src/audio_test.c`
+
+### Class 56 핵심 개념
+
+**왜 오디오 서버가 필요한가?**
+
+Linux의 `/dev/dsp` (OSS)는 한 프로세스만 열 수 있다. PulseAudio/PipeWire가 하는 일:
+
+- 앱A → PCM 데이터 전송
+- 앱B → PCM 데이터 전송
+- 서버: 믹싱 (합산 + 클램핑) → 하드웨어 출력
+
+citcaudio가 바로 이것을 한다.
+
+**오디오 믹싱 알고리즘:**
+
+```text
+mixed[i] = stream1[i] + stream2[i] + ...  (int32_t 합산)
+if mixed > 32767  → 32767               (클램핑)
+if mixed < -32768 → -32768
+결과를 int16_t로 /dev/dsp에 write
+```
+
+왜 int32_t? int16_t 최대값 32767, 두 스트림 합산 시 최대 65534 → int16_t 오버플로. int32_t로 합산 후 클램핑.
+
+**링 버퍼 (Ring Buffer):**
+
+```text
+[==읽은 영역==|---쓴 데이터---|==빈 공간==]
+              ^read           ^write
+```
+
+생산자(앱)는 뒤에 쓰고, 소비자(믹서)는 앞에서 읽는다. 끝에 도달하면 처음으로 되감기.
+
+### Class 56 구현 내용
+
+**오디오 프로토콜** (`citcaudio_proto.h`):
+
+- CDP와 동일한 `msg_header { type, size } + payload` 패턴
+- 소켓 경로: `/tmp/citc-audio-0`
+- 요청: `OPEN_STREAM(1)`, `WRITE(2)`, `CLOSE_STREAM(3)`
+- 이벤트: `STREAM_ID(100)`, `READY(101)`
+- `audio_write_all/read_all/send_msg/recv_msg` 헬퍼
+
+**오디오 서버** (`citcaudio.c`, ~430행):
+
+- OSS `/dev/dsp` 출력 (없으면 `/dev/null` fallback)
+- Unix 소켓 리스닝, 최대 4 클라이언트, 최대 8 스트림
+- timerfd 10ms 주기 믹싱 (441 frames/period)
+- poll() 이벤트 루프: listen_fd + timer_fd + client_fds
+- SIGPIPE 무시 (끊어진 소켓 write 방지)
+
+**클라이언트 라이브러리** (`citcaudio_client.h`, header-only):
+
+- `citcaudio_connect()`, `citcaudio_open_stream()`, `citcaudio_write()`, `citcaudio_close_stream()`
+
+### Class 56 겪었던 문제
+
+**MAX_PAYLOAD 크기 부족 (핵심 버그):**
+
+- 증상: audio_test가 서버와 연결 후 출력 없이 멈춤
+- 원인: `CITCAUDIO_MAX_PAYLOAD = 8192`인데, 100ms 청크 = 4410 frames × 4 bytes = 17640 bytes
+- 서버의 `process_client()`가 `hdr.size > 8192` 검사 → 클라이언트 즉시 끊김
+- 해결: `CITCAUDIO_MAX_PAYLOAD`를 32768 (32KB)로 증가
+
+**stdout 버퍼링:**
+
+- static 바이너리에서 stdout이 full buffering → 출력이 안 보임
+- `setvbuf(stdout, NULL, _IONBF, 0)`으로 unbuffered 모드 설정
+
+### Class 56 테스트 결과
+
+```text
+=== CITC Audio Test ===
+  [1] Connect to citcaudio ... PASS
+  [2] Open stream (44100Hz, stereo, 16bit) → id=1 ... PASS
+  [3] Write 440Hz sine (44100 frames) ... PASS
+  [4] Close stream ... PASS
+  [5] Disconnect ... PASS
+--- audio_test: 5/5 PASS ---
+```
+
+### Class 56 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `audio/src/citcaudio_proto.h` | **신규** — 프로토콜 정의, 메시지 헬퍼 |
+| `audio/src/citcaudio.c` | **신규** — 오디오 믹싱 서버 데몬 |
+| `audio/src/citcaudio_client.h` | **신규** — header-only 클라이언트 라이브러리 |
+| `audio/src/audio_test.c` | **신규** — 440Hz 사인파 테스트 (5/5 PASS) |
+| `audio/src/Makefile` | **신규** — 빌드 시스템 |
+
+---
+
+## Class 57: 오디오 WCL 통합 (dsound/xaudio2 → citcaudio)
+
+**파일:** `wcl/src/dlls/dsound/dsound.c`, `wcl/src/dlls/xaudio2/xaudio2.c`, `audio/src/beep.c`
+
+### Class 57 핵심 개념
+
+**WCL 오디오 경로 변경:**
+
+```text
+변경 전: Windows 앱 → DirectSound/XAudio2 → /dev/dsp 직접 접근 (1앱만 가능)
+변경 후: Windows 앱 → DirectSound/XAudio2 → citcaudio 서버 → /dev/dsp (다중 앱)
+```
+
+citcaudio 서버가 없으면 기존 `/dev/dsp` 직접 접근으로 자동 fallback.
+
+### Class 57 구현 내용
+
+**dsound.c 변경:**
+
+- `ds_buffer` 구조체에 `citcaudio_fd`, `stream_id` 필드 추가
+- `buf_Play()`: citcaudio 연결 시도 → 실패 시 OSS fallback
+- `audio_output()` 헬퍼: citcaudio 또는 OSS로 PCM 출력
+- `buf_Release()`: citcaudio 스트림 닫기 + 소켓 닫기
+
+**xaudio2.c 업그레이드 (스텁 → 실제 구현):**
+
+- `xa2_source_voice` 구조체: citcaudio 연결 정보 + 포맷 저장
+- `CreateSourceVoice()`: citcaudio 연결 + 스트림 열기
+- `SubmitSourceBuffer()`: PCM 데이터를 citcaudio로 전송 (기존: no-op)
+- `DestroyVoice()`: 스트림 닫기 + 메모리 해제
+
+**네이티브 beep 도구** (`audio/src/beep.c`):
+
+- `beep [freq] [ms]` — citcaudio 서버를 사용한 사인파 재생
+- 네이티브 Linux 앱이 citcaudio를 사용하는 데모
+
+**citcinit 서비스 등록** (`citcaudio.conf`):
+
+- 소켓 활성화: 클라이언트가 `/tmp/citc-audio-0`에 연결 시 자동 시작
+- `LISTEN_FDS` 환경변수로 소켓 fd 전달
+
+### Class 57 테스트 결과
+
+- beep 440 200: exit=0 (서버 연결 → 재생 → 정리)
+- audio_test: 5/5 PASS
+- WCL 회귀: 11/11 ALL PASS
+
+### Class 57 수정한 파일
+
+| 파일 | 변경 내용 |
+|------|-----------|
+| `wcl/src/dlls/dsound/dsound.c` | citcaudio 우선 연동, OSS fallback |
+| `wcl/src/dlls/xaudio2/xaudio2.c` | SubmitSourceBuffer 실제 구현 |
+| `audio/src/beep.c` | **신규** — 네이티브 비프 도구 |
+| `audio/src/citcaudio.c` | 소켓 활성화 (LISTEN_FDS) 지원 |
+| `audio/src/Makefile` | beep 빌드 추가 |
+| `system/citcinit/services/citcaudio.conf` | **신규** — 서비스 등록 |
+
+---
+
+## Class 58: 데미지 트래킹 (Damage Tracking)
+
+> 컴포지터가 변경된 영역만 다시 그리도록 최적화.
+> 매 프레임 전체 리드로 → 변경된 영역만 리드로.
+
+### 핵심 개념: 데미지 트래킹이란?
+
+GUI 컴포지터에서 **데미지(damage)** = "화면에서 변경된 영역".
+
+기존 문제:
+
+- `render_frame()`이 매 프레임 배경 + 전체 윈도우 + 커서를 리드로
+- idle 상태에서도 CPU 계속 사용
+- poll() 타임아웃(16ms)마다 무조건 리드로
+
+해결:
+
+- **데미지 영역 추적**: 변경된 사각형들을 기록
+- **선택적 렌더링**: 데미지가 있을 때만 `render_frame()` 호출
+- **배경 캐시**: 그래디언트 배경을 한 번만 계산, 이후 memcpy
+- **커서 데미지**: 이전 위치 + 새 위치만 리드로 (12x12 두 개)
+
+실제 컴포지터들도 동일한 기법 사용:
+
+- Wayland: `wl_surface.damage_buffer()` — 클라이언트가 변경 영역 보고
+- X11: XDamage 확장
+- Windows DWM: Dirty Region Tracking
+
+### 데미지 추적 구조
+
+```c
+/* 컴포지터 전역 상태에 추가 */
+struct { int x, y, w, h; } damage_rects[32];  /* 데미지 사각형 배열 */
+int damage_count;                              /* 현재 데미지 수 */
+int damage_full;                               /* 1이면 전체 리드로 */
+int prev_mouse_x, prev_mouse_y;               /* 이전 커서 위치 */
+uint32_t *bg_cache;                            /* 배경 캐시 버퍼 */
+int bg_cache_valid;                            /* 캐시 유효? */
+```
+
+핵심 함수들:
+
+```c
+damage_reset()          — 프레임 렌더 후 초기화
+damage_add(x,y,w,h)     — 사각형 영역 데미지 추가
+damage_add_full()       — 전체 화면 데미지 (레이아웃 변경 시)
+damage_add_window(idx)  — 윈도우 전체 영역 + 테두리 2px
+damage_has_any()        — 데미지 있는지 확인
+```
+
+### 데미지 소스별 분류
+
+| 이벤트 | 데미지 유형 | 이유 |
+|--------|------------|------|
+| 클라이언트 연결/해제 | `damage_add_full()` | 윈도우 추가/제거 |
+| surface 생성/삭제 | `damage_add_full()` | 레이아웃 변경 |
+| commit (내용 변경) | `damage_add_window()` | 해당 윈도우만 |
+| set_title | `damage_add_window()` | 타이틀바만 |
+| set_panel | `damage_add_full()` | 패널 레이아웃 |
+| CDP_REQ_DAMAGE | `damage_add()` 좌표변환 | 클라이언트 보고 |
+| 마우스 이동 | 이전+새 커서 (12x12×2) | 커서만 |
+| 드래그 중 마우스 | `damage_add_full()` | 윈도우 이동 |
+| 마우스 클릭 | `damage_add_full()` | Z-order/포커스 변경 |
+| 키보드 입력 | `damage_add_window()` | 포커스 윈도우 내용 |
+
+### 배경 캐시
+
+```c
+/* 그래디언트 배경을 한 번만 계산 → 이후 memcpy */
+if (!comp.bg_cache_valid) {
+    /* 그래디언트 직접 계산 (느림) */
+    compute_gradient(comp.bg_cache, ...);
+    comp.bg_cache_valid = 1;
+}
+memcpy(buf, comp.bg_cache, stride * height * 4);
+```
+
+효과: 배경 그리기가 O(width×height 계산) → O(memcpy)로 변경.
+
+### 메인 루프 변경
+
+```c
+/* 기존: 매 프레임 렌더링 */
+if (comp.need_redraw) {
+    render_frame();
+    comp.need_redraw = 0;
+}
+
+/* 변경: 데미지가 있을 때만 */
+if (comp.need_redraw && damage_has_any()) {
+    render_frame();
+    comp.need_redraw = 0;
+}
+```
+
+idle 상태에서 `need_redraw = 0`이고 `damage_count = 0`이면 렌더링 완전 건너뜀.
+
+### CDP 프로토콜 확장
+
+```c
+/* 클라이언트가 변경 영역을 컴포지터에 보고 */
+CDP_REQ_DAMAGE = 8
+
+struct cdp_damage {
+    uint32_t surface_id;
+    int32_t x, y, w, h;   /* 서피스 로컬 좌표 */
+};
+```
+
+컴포지터가 로컬 좌표를 화면 좌표로 변환:
+
+```c
+damage_add(win->x + req->x,
+           win->y + TITLEBAR_H + req->y,
+           req->w, req->h);
+```
+
+### 빌드/테스트 결과
+
+```text
+compositor: 빌드 성공 (클린 컴파일)
+shell:      빌드 성공
+terminal:   빌드 성공
+WCL:        11/11 ALL PASS (회귀 없음)
+```
+
+### 변경 파일
+
+| 파일 | 변경 |
+|------|------|
+| `display/compositor/src/compositor.c` | 데미지 추적 + 선택적 렌더링 + 배경 캐시 |
+| `display/protocol/cdp_proto.h` | `CDP_REQ_DAMAGE` 메시지 추가 |
+| `display/protocol/cdp_client.h` | `cdp_damage()` 헬퍼 추가 |
+
+---
+
+## Class 59: 윈도우 리사이즈 + 최소화/최대화
+
+> 윈도우 크기 변경, 최소화(숨기기), 최대화(화면 채우기).
+> 실제 앱 호환에 필수 — 많은 앱이 WM_SIZE에 의존.
+
+### 핵심 개념
+
+**윈도우 리사이즈 = 사용자가 윈도우 가장자리를 드래그하여 크기 변경.**
+
+구현 요소:
+
+1. **리사이즈 존 감지**: 윈도우 우하단 코너(8x8), 우측/하단 엣지(4px)
+2. **리사이즈 드래그**: 마우스 이동에 따라 윈도우 크기 실시간 변경
+3. **CDP_EVT_CONFIGURE**: 리사이즈 완료 시 클라이언트에 새 크기 알림
+4. **최소화/최대화 버튼**: 타이틀바에 [-][#][X] 버튼
+
+Wayland 대응:
+
+- `xdg_toplevel.configure()` — 서버가 클라이언트에 크기 변경 제안
+- 클라이언트가 새 크기로 버퍼 재할당 → attach → commit
+
+### 리사이즈 엣지 감지
+
+```c
+/* 반환: 0=없음, 1=우측, 2=하단, 3=코너(우하단) */
+static int resize_edge_at(struct window *w, int px, int py)
+{
+    /* 패널/최대화 윈도우는 리사이즈 불가 */
+    if (w->is_panel || w->maximized) return 0;
+
+    /* 비트 플래그: 1=우측, 2=하단, 3=코너 */
+    int right = w->x + w->w;
+    int bottom = w->y + w->h;
+
+    if (px >= right - 8 && py >= bottom - 8) return 3;  /* 코너 */
+    if (px >= right - 4 && py >= w->y + TITLEBAR_H) return 1;  /* 우측 */
+    if (py >= bottom - 4 && px >= w->x) return 2;  /* 하단 */
+    return 0;
+}
+```
+
+### 최소화/최대화
+
+타이틀바 버튼 레이아웃: `[제목...] [-] [#] [X]`
+
+| 버튼 | 기능 | 색상 |
+| --- | --- | --- |
+| [-] | 최소화 → `visible=0` | 회색 |
+| [#]/[R] | 최대화 ↔ 복원 토글 | 회색 |
+| [X] | 닫기 | 빨간색 |
+
+최대화:
+
+```c
+/* 원래 위치/크기 저장 → 화면 전체 차지 */
+w->saved_x = w->x; w->saved_y = w->y;
+w->saved_w = w->w; w->saved_h = w->h;
+w->x = 0; w->y = 0;
+w->w = screen_width;
+w->h = screen_height - panel_height;
+w->maximized = 1;
+```
+
+### CDP 프로토콜 확장
+
+```c
+CDP_EVT_CONFIGURE = 130   /* 서버 → 클라이언트: 크기 변경 알림 */
+
+struct cdp_configure {
+    uint32_t surface_id;
+    int32_t width, height;   /* 새 클라이언트 영역 크기 */
+};
+```
+
+전송 시점: 리사이즈 드래그 완료 (마우스 해제), 최대화/복원.
+
+### WCL user32 변경
+
+| 함수 | 변경 |
+| --- | --- |
+| `on_cdp_configure()` | **신규** — CDP configure → WM_SIZE 메시지 |
+| `ShowWindow()` | SW_MINIMIZE/MAXIMIZE/RESTORE 처리 |
+| `SetWindowPos()` | **신규** — 위치/크기 변경 + WM_SIZE |
+| `MoveWindow()` | 크기 변경 시 WM_SIZE 생성 |
+| `GetSystemMetrics()` | CDP에서 실제 해상도 사용 |
+
+WM_SIZE lParam 인코딩: `LOWORD = width, HIWORD = height`
+
+### 빌드/테스트 결과
+
+```text
+compositor:  빌드 성공 (클린 컴파일)
+shell:       빌드 성공
+terminal:    빌드 성공
+citcrun:     빌드 성공
+WCL 테스트:  11/11 ALL PASS (회귀 없음)
+```
+
+### 변경 파일
+
+| 파일 | 변경 |
+| --- | --- |
+| `display/compositor/src/compositor.c` | 리사이즈 로직, min/max 버튼, 상태 필드 |
+| `display/protocol/cdp_proto.h` | `CDP_EVT_CONFIGURE` 이벤트 + payload |
+| `display/protocol/cdp_client.h` | `on_configure` 콜백 + dispatch |
+| `wcl/src/dlls/user32/user32.c` | configure 처리, WM_SIZE, SetWindowPos |
+| `wcl/include/win32.h` | SIZE_RESTORED/MINIMIZED/MAXIMIZED, SW_* 상수 |
+
+---
+
+## Class 60: 알파 블렌딩 + 윈도우 그림자
+
+> 픽셀 단위 알파 블렌딩으로 반투명 합성.
+> 윈도우 그림자로 시각적 깊이감 표현.
+
+### 핵심 개념: 알파 블렌딩
+
+ARGB 포맷에서 알파 채널(A)은 불투명도를 나타냄:
+
+- `0xFF` = 완전 불투명 (기존 XRGB와 동일)
+- `0x00` = 완전 투명
+- `0x80` = 50% 반투명
+
+Porter-Duff "source over" 연산:
+
+```c
+result = src * src_alpha + dst * (1 - src_alpha)
+```
+
+최적화 포인트:
+
+- `sa == 0xFF` → 불투명: `dst = src` (기존 동작, 성능 영향 없음)
+- `sa == 0x00` → 완전 투명: `dst` 유지 (skip)
+- 기존 XRGB 클라이언트(format=0)는 alpha_blend 호출 자체를 건너뜀
+
+### 윈도우 그림자
+
+각 윈도우 뒤에 (4,4) 오프셋 반투명 검정 사각형:
+
+```c
+/* 0x40000000 = alpha=0x40(25%), RGB=0,0,0 */
+draw_rect_alpha(buf, win->x + 4, win->y + 4,
+                win->w, win->h, 0x40000000);
+```
+
+`draw_rect_alpha()`는 각 픽셀에 `alpha_blend()`를 적용하여 배경이 비침.
+
+### CDP 포맷 확장
+
+`cdp_attach_buffer.format` 필드 활용:
+
+- `format = 0` → XRGB8888 (기존, 알파 무시, 불투명 복사)
+- `format = 1` → ARGB8888 (알파 블렌딩 적용)
+
+컴포지터의 `cdp_surface` 구조체에 `format` 필드 추가.
+
+### 빌드/테스트 결과
+
+```text
+compositor:  빌드 성공
+WCL 테스트:  11/11 ALL PASS
+```
+
+### 변경 파일
+
+| 파일 | 변경 |
+| --- | --- |
+| `display/compositor/src/compositor.c` | `alpha_blend()`, `draw_rect_alpha()`, 그림자, ARGB blit |
+| `display/protocol/cdp_proto.h` | format 필드 문서화 |
+
+---
+
+## Class 61: PSF2 폰트 + 바탕화면
+
+> 8×8 비트맵 폰트를 PSF2 (8×16 Terminus급)로 업그레이드.
+> 바탕화면 이미지 지원 (그래디언트 대체).
+
+### 핵심 개념: PSF2 (PC Screen Font version 2)
+
+Linux 콘솔에서 사용하는 비트맵 폰트 형식:
+
+```c
+#define PSF2_MAGIC 0x864ab572
+
+struct psf2_header {    /* 32바이트 */
+    uint32_t magic, version, headersize, flags;
+    uint32_t numglyph, bytesperglyph, height, width;
+};
+```
+
+**font8x8과의 차이:**
+
+| 항목 | font8x8 | PSF2 |
+| --- | --- | --- |
+| 크기 | 8×8 고정 | 가변 (보통 8×16) |
+| 비트 순서 | LSB = 왼쪽 | MSB = 왼쪽 (표준) |
+| 글리프 수 | 128 (ASCII) | 256~512 (확장 가능) |
+| 유니코드 | 없음 | 테이블 지원 (flags=1) |
+| 파일 형식 | C 배열 | 독립 바이너리 파일 |
+
+비트 순서가 반대임에 주의:
+
+```c
+/* font8x8: bit 0 = 왼쪽 */
+if (glyph[row] & (1 << col))
+
+/* PSF2: bit 7 = 왼쪽 (MSB first) */
+if (row_data[col / 8] & (0x80 >> (col % 8)))
+```
+
+### 구현: header-only PSF2 파서 (`display/font/psf2.h`)
+
+```c
+struct psf2_font {
+    uint32_t width, height, numglyph, bytesperglyph;
+    uint8_t *glyphs;   /* malloc'd 글리프 데이터 */
+    int loaded;         /* 성공 여부 */
+};
+
+int psf2_load(struct psf2_font *font, const char *path);
+void psf2_free(struct psf2_font *font);
+void psf2_draw_char(uint32_t *buf, int stride, int x, int y,
+                    char ch, uint32_t color, const struct psf2_font *font);
+void psf2_draw_string(uint32_t *buf, int stride, int x, int y,
+                      const char *str, uint32_t color,
+                      const struct psf2_font *font);
+```
+
+모든 함수가 `static inline` — 별도 컴파일 단위 불필요.
+
+### 폰트 적용 패턴
+
+모든 컴포넌트에서 동일한 패턴:
+
+1. PSF2 전역 + 동적 폰트 크기 변수 선언
+2. 프로그램 시작 시 `psf2_load()` 시도
+3. 성공 시 `g_font_w`/`g_font_h` 업데이트
+4. 렌더링 시 `loaded` 체크 → PSF2 우선, font8x8 폴백
+
+```c
+static struct psf2_font g_psf2;
+static int g_font_w = 8, g_font_h = 8;
+
+/* 초기화 */
+if (psf2_load(&g_psf2, "/usr/share/fonts/ter-116n.psf") == 0) {
+    g_font_w = (int)g_psf2.width;
+    g_font_h = (int)g_psf2.height;
+}
+
+/* 렌더링 */
+if (g_psf2.loaded)
+    psf2_draw_char(buf, stride, x, y, ch, color, &g_psf2);
+else
+    /* font8x8 fallback */
+```
+
+### 바탕화면 이미지 지원
+
+컴포지터의 `render_background_cache()`에서:
+
+```c
+/* /usr/share/wallpaper.raw — XRGB8888 원시 데이터 */
+int wp_fd = open("/usr/share/wallpaper.raw", O_RDONLY);
+if (wp_fd >= 0) {
+    read(wp_fd, bg_cache, width * height * 4);
+    /* 성공하면 그래디언트 대신 이미지 사용 */
+}
+```
+
+변환 도구: `tools/mkwallpaper/raw_convert.py` (Pillow 사용)
+
+```bash
+python3 raw_convert.py input.png wallpaper.raw 1024 768
+```
+
+### 터미널 커서 업그레이드
+
+커서 렌더링도 PSF2 폰트 크기에 맞게 업데이트:
+
+- 커서 위치: `cursor_col * g_font_w`, `cursor_row * g_font_h`
+- 블록 커서 크기: `g_font_w × g_font_h`
+- 반전 문자: `psf2_draw_char()` with COLOR_BG
+
+### GDI32 지연 로드
+
+WCL의 gdi32.c는 프로그램 시작 시점에 CDP/compositor와 독립적이므로
+최초 TextOutA/DrawTextA 호출 시 PSF2를 지연 로드:
+
+```c
+static void gdi32_ensure_font(void) {
+    if (g_gdi_psf2_init) return;
+    g_gdi_psf2_init = 1;
+    psf2_load(&g_gdi_psf2, "/usr/share/fonts/ter-116n.psf");
+}
+```
+
+GetTextMetricsA도 PSF2 크기를 반환하도록 업데이트.
+
+### 겪었던 문제
+
+**1. citcshell.c 유니코드 × vs ASCII x 불일치:**
+
+- 증상: `Edit` 도구로 `"8x8"` 문자열을 찾으려 하면 "old_string not found" 에러
+- 원인: 파일에 `"8×8"` (유니코드 `×`, U+00D7)이 사용되어 있었으나, 검색은 `"8x8"` (ASCII `x`, U+0078)으로 시도
+- 해결: `Read`로 해당 라인을 정확히 읽어 유니코드 문자를 포함한 정확한 문자열로 교체
+- 교훈: 소스 파일의 주석이나 문자열에 유니코드가 포함될 수 있으므로, 편집 전 반드시 해당 라인을 `Read`로 확인
+
+**2. compositor.c `font_height()` 미사용 경고 (-Werror):**
+
+- 증상: `error: 'font_height' defined but not used [-Werror=unused-function]`
+- 원인: PSF2 적용 시 `font_height()` 함수를 정의했지만, 실제로 호출하는 코드가 없었음
+- 해결: info bar 높이 계산에서 `int bar_h = font_height() + 4;` 로 활용
+- 교훈: `-Werror` 빌드에서는 사용하지 않는 함수를 정의하면 안 됨. 정의와 사용을 동시에 추가
+
+### 빌드/테스트 결과
+
+```text
+compositor:  빌드 성공
+shell:       빌드 성공
+terminal:    빌드 성공
+WCL:         빌드 성공
+WCL 테스트:  11/11 ALL PASS
+```
+
+### 변경 파일
+
+| 파일 | 변경 |
+| --- | --- |
+| `display/font/psf2.h` | **신규** — PSF2 header-only 파서 |
+| `display/compositor/src/compositor.c` | PSF2 적용, 바탕화면 이미지, info bar 높이 동적화 |
+| `display/shell/src/citcshell.c` | PSF2 적용, draw_char/draw_string 업데이트 |
+| `display/terminal/src/citcterm.c` | PSF2 적용, 커서 크기 동적화, 80×25 유지 |
+| `wcl/src/dlls/gdi32/gdi32.c` | PSF2 지연 로드, TextOutA/DrawTextA/GetTextMetricsA |
+| `tools/mkwallpaper/raw_convert.py` | **신규** — PNG→XRGB8888 변환 도구 |
+
+---
+
+## Class 62: 클립보드 (복사/붙여넣기)
+
+> 앱 간 텍스트 클립보드. 네이티브 ↔ 네이티브, WCL ↔ 네이티브 모두 지원.
+
+### 핵심 개념: 클립보드 아키텍처
+
+**Wayland 클립보드:**
+- `wl_data_source` + `wl_data_device.set_selection()`: 복사
+- `wl_data_offer.receive(mime_type, fd)`: 붙여넣기 (파이프 기반)
+- MIME 타입으로 포맷 협상 (text/plain, image/png 등)
+- 복잡한 비동기 프로토콜
+
+**CDP 클립보드 (교육용 단순화):**
+- 텍스트만 지원 (UTF-8, 최대 4KB)
+- 동기 메시지 교환 (SET → 저장, GET → 응답)
+- 컴포지터가 중앙 저장소
+
+```
+앱A: "복사" → CDP_REQ_CLIPBOARD_SET(text) → 컴포지터 버퍼 저장
+앱B: "붙여넣기" → CDP_REQ_CLIPBOARD_GET → 컴포지터가 CDP_EVT_CLIPBOARD_DATA 응답
+```
+
+### CDP 프로토콜 확장
+
+```c
+/* 요청 */
+CDP_REQ_CLIPBOARD_SET  = 9   /* 클립보드에 텍스트 저장 */
+CDP_REQ_CLIPBOARD_GET  = 10  /* 클립보드 내용 요청 */
+
+/* 이벤트 */
+CDP_EVT_CLIPBOARD_DATA = 140 /* GET 응답: 클립보드 텍스트 전달 */
+
+/* Payload */
+#define CDP_CLIPBOARD_MAX 4096
+struct cdp_clipboard_set {
+    uint32_t len;
+    char text[CDP_CLIPBOARD_MAX];
+};
+struct cdp_clipboard_data {
+    uint32_t len;
+    char text[CDP_CLIPBOARD_MAX];
+};
+```
+
+`CDP_MSG_MAX_PAYLOAD`을 256 → 4352로 확장 (4KB 클립보드 지원).
+
+### 키 이벤트 확장: 모디파이어
+
+터미널에서 Ctrl+Shift+C/V를 구별하기 위해 `cdp_key`에 `modifiers` 추가:
+
+```c
+#define CDP_MOD_SHIFT  1
+#define CDP_MOD_CTRL   2
+
+struct cdp_key {
+    uint32_t keycode;
+    uint32_t state;
+    uint32_t character;
+    uint32_t modifiers;  /* 비트마스크 */
+};
+```
+
+### 터미널 클립보드
+
+- **Ctrl+Shift+C**: 커서 이전 행의 텍스트 복사 → `cdp_clipboard_set()`
+- **Ctrl+Shift+V**: `cdp_clipboard_get()` 요청 → 응답 텍스트를 PTY에 write (쉘 입력)
+
+모디파이어 체크로 일반 Ctrl+C(SIGINT)와 구별:
+
+```c
+if ((modifiers & (CDP_MOD_CTRL | CDP_MOD_SHIFT)) ==
+    (CDP_MOD_CTRL | CDP_MOD_SHIFT)) {
+    if (keycode == KEY_C) { term_clipboard_copy(term); return; }
+    if (keycode == KEY_V) { cdp_clipboard_get(term->conn); return; }
+}
+```
+
+### WCL Win32 클립보드 API
+
+| Win32 API | 구현 |
+| --- | --- |
+| `OpenClipboard(hwnd)` | CDP GET으로 최신 데이터 동기 수신 |
+| `CloseClipboard()` | 플래그 해제 |
+| `EmptyClipboard()` | 로컬 버퍼 초기화 |
+| `SetClipboardData(CF_TEXT, h)` | CDP SET으로 텍스트 전송 |
+| `GetClipboardData(CF_TEXT)` | 로컬 버퍼 포인터 반환 |
+| `IsClipboardFormatAvailable` | CF_TEXT 여부 확인 |
+
+CF_TEXT(=1)만 지원. Win32에서 hMem은 GlobalAlloc'd HGLOBAL이지만, WCL에서는 직접 문자열 포인터로 간소화.
+
+### 겪었던 문제
+
+**1. compositor.c `client->fd` vs `client_fd` 변수명 혼동:**
+
+- 증상: 컴파일 에러 — `struct cdp_client` has no member named `fd`
+- 원인: 클립보드 GET 핸들러에서 `client->fd`를 사용했지만, `cdp_handle_client_msg()` 함수의 로컬 변수명은 `client_fd`
+- 해결: `client->fd` → `client_fd`로 변경
+- 교훈: 같은 파일 내에서도 함수마다 변수명 규칙이 다를 수 있음. 핸들러 추가 시 해당 함수의 기존 코드를 먼저 확인
+
+**2. CDP_MSG_MAX_PAYLOAD 크기 부족:**
+
+- 증상: 클립보드 텍스트(최대 4KB) + 구조체 헤더가 기존 256바이트 제한 초과
+- 원인: `CDP_MSG_MAX_PAYLOAD = 256`으로는 `struct cdp_clipboard_set { len + text[4096] }` 전송 불가
+- 해결: `CDP_MSG_MAX_PAYLOAD`를 4352 (4096 + 256)로 확장
+- 교훈: 프로토콜에 큰 페이로드를 추가할 때 최대 메시지 크기 상수를 반드시 확인/갱신
+
+### 빌드/테스트 결과
+
+```text
+compositor:  빌드 성공
+shell:       빌드 성공
+terminal:    빌드 성공
+WCL:         빌드 성공
+WCL 테스트:  11/11 ALL PASS
+```
+
+### 변경 파일
+
+| 파일 | 변경 |
+| --- | --- |
+| `display/protocol/cdp_proto.h` | 클립보드 메시지, CDP_MOD_*, modifiers 필드 |
+| `display/protocol/cdp_client.h` | `cdp_clipboard_set/get()`, on_clipboard_data 콜백 |
+| `display/compositor/src/compositor.c` | 클립보드 저장소, SET/GET 핸들러, modifiers 전송 |
+| `display/terminal/src/citcterm.c` | Ctrl+Shift+C/V, 복사/붙여넣기 |
+| `wcl/src/dlls/user32/user32.c` | Win32 클립보드 API 6개 |
+| `wcl/include/win32.h` | CF_TEXT 상수 |
+
+---
+
+## Class 63: 통합 테스트 + 해상도 관리 + 폴리시
+
+> Phase 6 캡스톤. 해상도 관리, 태스크바 윈도우 목록, 통합 테스트.
+
+### 해상도 관리
+
+CDP_REQ_SET_MODE 프로토콜 추가:
+
+```c
+CDP_REQ_SET_MODE = 11
+
+struct cdp_set_mode {
+    uint32_t width, height, refresh;
+};
+```
+
+현재 DRM 모드셋은 부팅 시 고정이므로 로그 출력만 수행.
+향후 DRM 커넥터 모드 열거 + KMS 모드셋으로 확장 가능.
+
+### 태스크바 윈도우 목록
+
+셸이 열린 윈도우를 태스크바에 버튼으로 표시:
+
+```
+[CITC OS] | [Terminal] [Demo] | [citcterm] [gui_app] | 00:05:23
+  로고      런처 버튼           윈도우 목록             시계
+```
+
+**CDP 프로토콜:**
+
+- `CDP_REQ_LIST_WINDOWS = 12`: 셸이 윈도우 목록 요청
+- `CDP_EVT_WINDOW_LIST = 141`: 컴포지터가 목록 응답 (ID, 제목, 최소화 상태)
+- `CDP_REQ_RAISE_SURFACE = 13`: 셸이 윈도우 클릭 시 포커스+복원 요청
+
+**컴포지터 RAISE 처리:**
+
+1. 최소화 해제 (`minimized=0`, `visible=1`)
+2. Z-order 맨 위로 이동 (배열 끝으로 시프트)
+3. `cdp_surface.window_idx` 갱신
+4. `focused` 업데이트, `damage_add_full()`
+
+**셸 구현:**
+
+- 1초마다 `update_window_list()` → `cdp_list_windows()` 동기 호출
+- 패널 제외한 윈도우만 표시
+- 제목 최대 12자, 최소화 윈도우는 흐린색
+- 클릭 → `cdp_raise_surface()` → 포커스+복원
+
+### 겪었던 문제
+
+**1. compositor.c `cdp_surface` 구조체에 `id` 멤버 없음:**
+
+- 증상: 컴파일 에러 — `struct cdp_surface has no member named 'id'`
+- 원인: LIST_WINDOWS 핸들러에서 `w->cdp_surface[i].id`로 서피스 ID에 접근하려 했지만, 해당 구조체에는 `id` 필드가 없음. 서피스 ID는 배열 인덱스 + 1 규칙 (`cdp_surface_index(surface_id)` = `surface_id - 1`)
+- 해결: `(uint32_t)(w->cdp_surface_idx + 1)` 로 인덱스에서 ID를 계산
+- 교훈: 컴포지터의 서피스 ID 규칙을 항상 기억 — ID = index + 1, 명시적 `id` 필드 없음
+
+**2. WSL 경로에서 `cd` 실패:**
+
+- 증상: `wsl -e bash -c "cd /mnt/e/... && make"` 실행 시 디렉토리를 찾을 수 없음
+- 원인: WSL 내부에서 Windows 드라이브 마운트 경로 문제. 따옴표 중첩으로 인한 셸 해석 오류
+- 해결: `cd` 대신 `make -C /mnt/e/personal_project/citc_os/display/compositor` 처럼 `-C` 옵션으로 직접 경로 지정
+- 교훈: WSL에서는 `cd` + `&&` 체이닝 대신 각 도구의 `-C` (작업 디렉토리 지정) 옵션 활용이 안정적
+
+**3. Makefile 경로 오인:**
+
+- 증상: `make -C display/compositor/src` 실행 시 "No rule to make target" 에러
+- 원인: Makefile이 `display/compositor/src/`가 아닌 `display/compositor/`에 위치
+- 해결: `Glob display/**/Makefile`로 정확한 경로 확인 후 `make -C display/compositor` 사용
+- 교훈: Makefile 위치를 가정하지 말고 `Glob`으로 확인. 이 프로젝트는 `component/Makefile` 규칙 (src/ 안이 아님)
+
+### 통합 테스트 (`tests/phase6_test.sh`)
+
+12개 항목 검증:
+
+1. 오디오 서버 빌드
+2. 컴포지터 빌드
+3. 쉘 빌드
+4. 터미널 빌드
+5. WCL 빌드
+6. WCL 회귀 테스트 (11/11 ALL PASS)
+7-12. Phase 6 신규 파일 존재 확인
+
+```text
+=== Results: 12/12 passed, 0 failed ===
+ALL PASS
+```
+
+### Phase 6 완료 요약
+
+| 항목 | Phase 5 끝 | Phase 6 끝 |
+| --- | --- | --- |
+| 오디오 | WCL만 (/dev/dsp) | 서버 믹싱 + 네이티브 |
+| 윈도우 관리 | 드래그만 | 리사이즈 + 최소화 + 최대화 |
+| 렌더링 | 불투명 복사 | 알파 블렌딩 + 그림자 |
+| 폰트 | 8x8 비트맵 | PSF2 8x16 (fallback 유지) |
+| 클립보드 | 없음 | 텍스트 복사/붙여넣기 |
+| 바탕화면 | 그래디언트 | 이미지 배경 (fallback) |
+| 성능 | 매 프레임 전체 리드로 | 데미지 기반 부분 리드로 |
+| 태스크바 | 런처만 | 윈도우 목록 + 클릭 포커스 |
+| 데스크탑 느낌 | 교육용 데모 | 실용적 데스크탑 OS |
+
+### 변경 파일
+
+| 파일 | 변경 |
+| --- | --- |
+| `display/protocol/cdp_proto.h` | SET_MODE, LIST_WINDOWS, RAISE_SURFACE |
+| `display/protocol/cdp_client.h` | `cdp_raise_surface()`, `cdp_list_windows()` |
+| `display/compositor/src/compositor.c` | LIST_WINDOWS, RAISE_SURFACE 핸들러 |
+| `display/shell/src/citcshell.c` | 윈도우 목록 표시 + 클릭 포커스 |
+| `tests/phase6_test.sh` | **신규** — 통합 테스트 |
