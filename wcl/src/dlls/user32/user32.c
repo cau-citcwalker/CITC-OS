@@ -394,6 +394,40 @@ static void on_cdp_focus_out(uint32_t surface_id)
 		g_focus_hwnd = NULL;
 }
 
+/*
+ * CDP configure → WM_SIZE (Class 59)
+ *
+ * 컴포지터가 윈도우 크기를 변경했을 때:
+ *   1. 내부 상태 업데이트 (width, height)
+ *   2. 픽셀 버퍼 재할당
+ *   3. WM_SIZE 메시지 생성
+ */
+static void on_cdp_configure(uint32_t surface_id, int width, int height)
+{
+	HWND hwnd = surface_to_hwnd(surface_id);
+
+	if (!hwnd)
+		return;
+
+	struct wnd_entry *w = hwnd_to_wnd(hwnd);
+
+	if (!w)
+		return;
+
+	w->width = width;
+	w->height = height;
+	w->needs_paint = 1;
+
+	MSG m;
+
+	memset(&m, 0, sizeof(m));
+	m.hwnd = hwnd;
+	m.message = WM_SIZE;
+	m.wParam = (WPARAM)SIZE_RESTORED;
+	m.lParam = (LPARAM)((uint16_t)width | ((uint16_t)height << 16));
+	enqueue_msg(&m);
+}
+
 /* ============================================================
  * CDP 연결 (lazy 초기화)
  * ============================================================
@@ -416,6 +450,7 @@ static void ensure_cdp_init(void)
 		g_cdp->on_pointer_button = on_cdp_pointer_button;
 		g_cdp->on_focus_in = on_cdp_focus_in;
 		g_cdp->on_focus_out = on_cdp_focus_out;
+		g_cdp->on_configure = on_cdp_configure;
 	} else {
 		fprintf(stderr, "user32: CDP 컴포지터 없음 (로컬 모드)\n");
 	}
@@ -639,15 +674,32 @@ static int32_t u32_ShowWindow(HWND hwnd, int cmd)
 
 	int was_visible = w->visible;
 
-	if (cmd == SW_HIDE) {
+	switch (cmd) {
+	case SW_HIDE:
 		w->visible = 0;
-	} else {
+		break;
+	case SW_MINIMIZE:
+	case SW_SHOWMINIMIZED:
+		w->visible = 0;
+		break;
+	case SW_MAXIMIZE: /* == SW_SHOWMAXIMIZED (3) */
 		w->visible = 1;
 		w->needs_paint = 1;
-
-		/* CDP commit (최초 표시) */
 		if (w->cdp_win && g_cdp)
 			cdp_commit_to(g_cdp, w->cdp_win);
+		break;
+	case SW_RESTORE:
+		w->visible = 1;
+		w->needs_paint = 1;
+		if (w->cdp_win && g_cdp)
+			cdp_commit_to(g_cdp, w->cdp_win);
+		break;
+	default:
+		w->visible = 1;
+		w->needs_paint = 1;
+		if (w->cdp_win && g_cdp)
+			cdp_commit_to(g_cdp, w->cdp_win);
+		break;
 	}
 
 	return was_visible;
@@ -1328,6 +1380,8 @@ static int32_t u32_MoveWindow(HWND hwnd, int x, int y,
 	if (!w)
 		return FALSE;
 
+	int size_changed = (w->width != width || w->height != height);
+
 	w->x = x;
 	w->y = y;
 	w->width = width;
@@ -1336,6 +1390,61 @@ static int32_t u32_MoveWindow(HWND hwnd, int x, int y,
 	if (repaint)
 		w->needs_paint = 1;
 
+	/* 크기 변경 시 WM_SIZE 생성 (Class 59) */
+	if (size_changed && w->wndproc) {
+		MSG m;
+
+		memset(&m, 0, sizeof(m));
+		m.hwnd = hwnd;
+		m.message = WM_SIZE;
+		m.wParam = (WPARAM)SIZE_RESTORED;
+		m.lParam = (LPARAM)((uint16_t)width | ((uint16_t)height << 16));
+		enqueue_msg(&m);
+	}
+
+	return TRUE;
+}
+
+/* --- SetWindowPos --- */
+
+__attribute__((ms_abi))
+static int32_t u32_SetWindowPos(HWND hwnd, HWND hWndInsertAfter,
+				int x, int y, int cx, int cy,
+				uint32_t uFlags)
+{
+	(void)hWndInsertAfter;
+	struct wnd_entry *w = hwnd_to_wnd(hwnd);
+
+	if (!w)
+		return FALSE;
+
+	#define SWP_NOMOVE  0x0002
+	#define SWP_NOSIZE  0x0001
+
+	if (!(uFlags & SWP_NOMOVE)) {
+		w->x = x;
+		w->y = y;
+	}
+	if (!(uFlags & SWP_NOSIZE)) {
+		int size_changed = (w->width != cx || w->height != cy);
+
+		w->width = cx;
+		w->height = cy;
+
+		if (size_changed && w->wndproc) {
+			MSG m;
+
+			memset(&m, 0, sizeof(m));
+			m.hwnd = hwnd;
+			m.message = WM_SIZE;
+			m.wParam = (WPARAM)SIZE_RESTORED;
+			m.lParam = (LPARAM)((uint16_t)cx |
+					    ((uint16_t)cy << 16));
+			enqueue_msg(&m);
+		}
+	}
+
+	w->needs_paint = 1;
 	return TRUE;
 }
 
@@ -1371,8 +1480,13 @@ __attribute__((ms_abi))
 static int u32_GetSystemMetrics(int index)
 {
 	switch (index) {
-	case SM_CXSCREEN:  return 800;   /* 기본 해상도 */
-	case SM_CYSCREEN:  return 600;
+	case SM_CXSCREEN:
+		/* CDP에서 실제 해상도 사용 (Class 59) */
+		return (g_cdp && g_cdp->screen_width > 0)
+			? (int)g_cdp->screen_width : 800;
+	case SM_CYSCREEN:
+		return (g_cdp && g_cdp->screen_height > 0)
+			? (int)g_cdp->screen_height : 600;
 	case SM_CXICON:    return 32;
 	case SM_CYICON:    return 32;
 	case SM_CXCURSOR:  return 32;
@@ -1434,6 +1548,142 @@ void user32_commit_window(HWND hwnd)
 }
 
 /* ============================================================
+ * 클립보드 API (Class 62)
+ * ============================================================
+ *
+ * Windows 클립보드 API → CDP 클립보드 메시지 매핑.
+ *
+ * Windows 클립보드 모델:
+ *   OpenClipboard(hwnd) → 잠금 획득
+ *   EmptyClipboard()
+ *   SetClipboardData(CF_TEXT, handle) → 데이터 설정
+ *   CloseClipboard() → 잠금 해제
+ *
+ * 읽기:
+ *   OpenClipboard(hwnd)
+ *   handle = GetClipboardData(CF_TEXT)
+ *   text = GlobalLock(handle)
+ *   ... 사용 ...
+ *   GlobalUnlock(handle)
+ *   CloseClipboard()
+ *
+ * CDP 매핑: 단순화하여 텍스트만 지원 (CF_TEXT).
+ * Open/Close는 상태 플래그만 관리.
+ */
+
+static int g_clipboard_open;
+static char g_clipboard_local[4096];
+static uint32_t g_clipboard_local_len;
+
+/* 클립보드 데이터 수신 콜백 (CDP_EVT_CLIPBOARD_DATA) */
+static void on_cdp_clipboard_data(const char *text, uint32_t len)
+{
+	if (len > sizeof(g_clipboard_local) - 1)
+		len = sizeof(g_clipboard_local) - 1;
+	memcpy(g_clipboard_local, text, len);
+	g_clipboard_local[len] = '\0';
+	g_clipboard_local_len = len;
+}
+
+__attribute__((ms_abi))
+static int32_t u32_OpenClipboard(HWND hwnd)
+{
+	(void)hwnd;
+	g_clipboard_open = 1;
+
+	/* CDP에서 최신 클립보드 가져오기 */
+	if (g_cdp) {
+		g_cdp->on_clipboard_data = on_cdp_clipboard_data;
+		cdp_clipboard_get(g_cdp);
+		/* 동기 대기: 응답 수신 */
+		uint32_t type, size;
+		uint8_t payload[CDP_MSG_MAX_PAYLOAD];
+
+		if (cdp_recv_msg(g_cdp->sock_fd, &type, payload,
+				 sizeof(payload), &size) >= 0) {
+			if (type == CDP_EVT_CLIPBOARD_DATA) {
+				struct cdp_clipboard_data *cb =
+					(struct cdp_clipboard_data *)payload;
+				on_cdp_clipboard_data(cb->text, cb->len);
+			}
+		}
+	}
+	return TRUE;
+}
+
+__attribute__((ms_abi))
+static int32_t u32_CloseClipboard(void)
+{
+	g_clipboard_open = 0;
+	return TRUE;
+}
+
+__attribute__((ms_abi))
+static int32_t u32_EmptyClipboard(void)
+{
+	g_clipboard_local[0] = '\0';
+	g_clipboard_local_len = 0;
+	return TRUE;
+}
+
+/*
+ * SetClipboardData — CF_TEXT만 지원
+ *
+ * Windows에서 hMem은 GlobalAlloc'd HGLOBAL이지만,
+ * WCL에서는 직접 문자열 포인터로 처리 (간소화).
+ */
+__attribute__((ms_abi))
+static HANDLE u32_SetClipboardData(UINT format, HANDLE hMem)
+{
+	if (format != 1 /* CF_TEXT */)
+		return NULL;
+
+	if (!hMem)
+		return NULL;
+
+	const char *text = (const char *)hMem;
+	uint32_t len = (uint32_t)strlen(text);
+
+	if (len > sizeof(g_clipboard_local) - 1)
+		len = sizeof(g_clipboard_local) - 1;
+
+	memcpy(g_clipboard_local, text, len);
+	g_clipboard_local[len] = '\0';
+	g_clipboard_local_len = len;
+
+	/* CDP로 전송 */
+	if (g_cdp)
+		cdp_clipboard_set(g_cdp, g_clipboard_local, len);
+
+	return hMem;
+}
+
+/*
+ * GetClipboardData — CF_TEXT만 지원
+ *
+ * 반환값은 로컬 버퍼 포인터 (GlobalLock 없이 직접 사용 가능).
+ */
+__attribute__((ms_abi))
+static HANDLE u32_GetClipboardData(UINT format)
+{
+	if (format != 1 /* CF_TEXT */)
+		return NULL;
+
+	if (g_clipboard_local_len == 0)
+		return NULL;
+
+	return (HANDLE)g_clipboard_local;
+}
+
+__attribute__((ms_abi))
+static int32_t u32_IsClipboardFormatAvailable(UINT format)
+{
+	if (format == 1 /* CF_TEXT */ && g_clipboard_local_len > 0)
+		return TRUE;
+	return FALSE;
+}
+
+/* ============================================================
  * 스텁 테이블
  * ============================================================ */
 
@@ -1482,6 +1732,7 @@ struct stub_entry user32_stub_table[] = {
 	{ "user32.dll", "SetWindowTextA",    (void *)u32_SetWindowTextA },
 	{ "user32.dll", "GetWindowTextA",    (void *)u32_GetWindowTextA },
 	{ "user32.dll", "MoveWindow",        (void *)u32_MoveWindow },
+	{ "user32.dll", "SetWindowPos",      (void *)u32_SetWindowPos },
 
 	/* 포커스 */
 	{ "user32.dll", "SetFocus",          (void *)u32_SetFocus },
@@ -1493,6 +1744,15 @@ struct stub_entry user32_stub_table[] = {
 	/* 리소스 스텁 */
 	{ "user32.dll", "LoadCursorA",       (void *)u32_LoadCursorA },
 	{ "user32.dll", "LoadIconA",         (void *)u32_LoadIconA },
+
+	/* 클립보드 (Class 62) */
+	{ "user32.dll", "OpenClipboard",     (void *)u32_OpenClipboard },
+	{ "user32.dll", "CloseClipboard",    (void *)u32_CloseClipboard },
+	{ "user32.dll", "EmptyClipboard",    (void *)u32_EmptyClipboard },
+	{ "user32.dll", "SetClipboardData",  (void *)u32_SetClipboardData },
+	{ "user32.dll", "GetClipboardData",  (void *)u32_GetClipboardData },
+	{ "user32.dll", "IsClipboardFormatAvailable",
+					     (void *)u32_IsClipboardFormatAvailable },
 
 	{ NULL, NULL, NULL }
 };

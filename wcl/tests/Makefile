@@ -19,7 +19,13 @@ TARGETS = $(BUILD_DIR)/hello.exe \
           $(BUILD_DIR)/api_test.exe \
           $(BUILD_DIR)/reg_test.exe \
           $(BUILD_DIR)/gui_test.exe \
-          $(BUILD_DIR)/dx_test.exe
+          $(BUILD_DIR)/dx_test.exe \
+          $(BUILD_DIR)/cube_test.exe \
+          $(BUILD_DIR)/thread_test.exe \
+          $(BUILD_DIR)/com_test.exe \
+          $(BUILD_DIR)/net_test.exe \
+          $(BUILD_DIR)/d3d12_test.exe \
+          $(BUILD_DIR)/app_test.exe
 
 all: $(TARGETS)
 
@@ -51,6 +57,36 @@ $(BUILD_DIR)/gui_test.exe: gui_test.c | $(BUILD_DIR)
 $(BUILD_DIR)/dx_test.exe: dx_test.c | $(BUILD_DIR)
 	@echo "  MINGW dx_test.exe"
 	@$(CROSS_CC) $(CROSS_CFLAGS) -o $@ $< $(CROSS_LDFLAGS) -luser32 -ld3d11 -ldxgi
+	@echo "  OK    $@"
+
+$(BUILD_DIR)/cube_test.exe: cube_test.c | $(BUILD_DIR)
+	@echo "  MINGW cube_test.exe"
+	@$(CROSS_CC) $(CROSS_CFLAGS) -o $@ $< $(CROSS_LDFLAGS) -luser32 -ld3d11 -ldxgi -ldsound
+	@echo "  OK    $@"
+
+$(BUILD_DIR)/thread_test.exe: thread_test.c | $(BUILD_DIR)
+	@echo "  MINGW thread_test.exe"
+	@$(CROSS_CC) $(CROSS_CFLAGS) -o $@ $< $(CROSS_LDFLAGS)
+	@echo "  OK    $@"
+
+$(BUILD_DIR)/com_test.exe: com_test.c | $(BUILD_DIR)
+	@echo "  MINGW com_test.exe"
+	@$(CROSS_CC) $(CROSS_CFLAGS) -o $@ $< $(CROSS_LDFLAGS) -lole32
+	@echo "  OK    $@"
+
+$(BUILD_DIR)/net_test.exe: net_test.c | $(BUILD_DIR)
+	@echo "  MINGW net_test.exe"
+	@$(CROSS_CC) $(CROSS_CFLAGS) -o $@ $< $(CROSS_LDFLAGS) -lws2_32
+	@echo "  OK    $@"
+
+$(BUILD_DIR)/d3d12_test.exe: d3d12_test.c | $(BUILD_DIR)
+	@echo "  MINGW d3d12_test.exe"
+	@$(CROSS_CC) $(CROSS_CFLAGS) -o $@ $< $(CROSS_LDFLAGS) -ld3d12
+	@echo "  OK    $@"
+
+$(BUILD_DIR)/app_test.exe: app_test.c | $(BUILD_DIR)
+	@echo "  MINGW app_test.exe"
+	@$(CROSS_CC) $(CROSS_CFLAGS) -o $@ $< $(CROSS_LDFLAGS) -ladvapi32 -lws2_32 -lole32 -ld3d12
 	@echo "  OK    $@"
 
 $(BUILD_DIR):

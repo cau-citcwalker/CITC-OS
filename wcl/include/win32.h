@@ -151,6 +151,17 @@ typedef void      *LPOVERLAPPED;
 #define ERROR_DISK_FULL            112
 #define ERROR_ALREADY_EXISTS       183
 
+/* 서비스 에러 코드 */
+#define ERROR_SERVICE_DOES_NOT_EXIST  1060
+#define ERROR_SERVICE_ALREADY_RUNNING 1056
+
+/* Token 접근 권한 */
+#define TOKEN_QUERY               0x0008
+#define TOKEN_ADJUST_PRIVILEGES   0x0020
+
+/* SC_MANAGER 접근 권한 */
+#define SC_MANAGER_ALL_ACCESS     0xF003F
+
 /* SetFilePointer / GetFileSize 실패 반환값 */
 #define INVALID_SET_FILE_POINTER  ((DWORD)-1)
 #define INVALID_FILE_SIZE         ((DWORD)-1)
@@ -227,6 +238,12 @@ typedef LRESULT (__attribute__((ms_abi)) *WNDPROC)(HWND, UINT, WPARAM, LPARAM);
 #define WM_CREATE       0x0001
 #define WM_DESTROY      0x0002
 #define WM_SIZE         0x0005
+#define SIZE_RESTORED   0
+#define SIZE_MINIMIZED  1
+#define SIZE_MAXIMIZED  2
+
+/* 클립보드 포맷 (Class 62) */
+#define CF_TEXT         1
 #define WM_SETFOCUS     0x0007
 #define WM_KILLFOCUS    0x0008
 #define WM_PAINT        0x000F
@@ -262,7 +279,13 @@ typedef LRESULT (__attribute__((ms_abi)) *WNDPROC)(HWND, UINT, WPARAM, LPARAM);
 
 /* ShowWindow 명령 */
 #define SW_HIDE          0
+#define SW_SHOWNORMAL    1
+#define SW_SHOWMINIMIZED 2
+#define SW_SHOWMAXIMIZED 3
+#define SW_MAXIMIZE      3
 #define SW_SHOW          5
+#define SW_MINIMIZE      6
+#define SW_RESTORE       9
 #define SW_SHOWDEFAULT   10
 
 /* CW_USEDEFAULT — 시스템이 위치/크기 결정 */
@@ -498,5 +521,235 @@ typedef struct IUnknownVtbl {
 	ULONG   (__attribute__((ms_abi)) *AddRef)(void *This);
 	ULONG   (__attribute__((ms_abi)) *Release)(void *This);
 } IUnknownVtbl;
+
+/* ============================================================
+ * 오디오 타입
+ * ============================================================ */
+
+/* WAVEFORMATEX — PCM 오디오 포맷 기술자 */
+typedef struct {
+	uint16_t wFormatTag;
+	uint16_t nChannels;
+	uint32_t nSamplesPerSec;
+	uint32_t nAvgBytesPerSec;
+	uint16_t nBlockAlign;
+	uint16_t wBitsPerSample;
+	uint16_t cbSize;
+} WAVEFORMATEX;
+
+#define WAVE_FORMAT_PCM 1
+
+/* DSBUFFERDESC — DirectSound 버퍼 기술자 */
+typedef struct {
+	DWORD dwSize;
+	DWORD dwFlags;
+	DWORD dwBufferBytes;
+	DWORD dwReserved;
+	WAVEFORMATEX *lpwfxFormat;
+} DSBUFFERDESC;
+
+/* DirectSound 플래그 */
+#define DSBCAPS_PRIMARYBUFFER  0x00000001
+#define DSBCAPS_CTRLVOLUME     0x00000080
+#define DSBCAPS_CTRLFREQUENCY  0x00000020
+#define DSBCAPS_GLOBALFOCUS    0x00008000
+#define DSSCL_PRIORITY         2
+#define DSBPLAY_LOOPING        0x00000001
+
+/* DS error codes */
+#define DS_OK                  0
+#define DSERR_GENERIC         ((HRESULT)0x80004005)
+
+/* ============================================================
+ * 스레딩 & 동기화 타입
+ * ============================================================
+ *
+ * Win32 스레딩 모델:
+ *   CreateThread → 스레드 핸들 반환 (HANDLE)
+ *   WaitForSingleObject → 핸들이 시그널 상태가 될 때까지 대기
+ *
+ * 동기화 객체:
+ *   Event — 시그널/논시그널 상태 (manual/auto reset)
+ *   Mutex — 상호 배제 (재귀적)
+ *   CriticalSection — 프로세스 내 경량 뮤텍스
+ */
+
+/* 스레드 프로시저 — ms_abi로 호출되는 콜백 */
+typedef DWORD (__attribute__((ms_abi)) *LPTHREAD_START_ROUTINE)(void *);
+
+/*
+ * CRITICAL_SECTION — 경량 뮤텍스
+ *
+ * 실제 Windows: 40바이트 (DebugInfo, LockCount, RecursionCount 등)
+ * 우리 구현: 내부적으로 pthread_mutex_t를 가리키는 포인터
+ * 크기를 넉넉히 잡아 앱이 스택/구조체에 직접 선언해도 안전하게.
+ */
+typedef struct {
+	void *DebugInfo;
+	long LockCount;
+	long RecursionCount;
+	void *OwningThread;
+	void *LockSemaphore;
+	uintptr_t SpinCount;
+} CRITICAL_SECTION;
+
+/* SECURITY_ATTRIBUTES — 대부분 NULL로 전달되지만 선언 필요 */
+typedef struct {
+	DWORD nLength;
+	void *lpSecurityDescriptor;
+	BOOL bInheritHandle;
+} SECURITY_ATTRIBUTES;
+
+/* ============================================================
+ * 시간 타입
+ * ============================================================ */
+
+/* FILETIME — 100ns 단위, 1601-01-01 기준 */
+typedef struct {
+	DWORD dwLowDateTime;
+	DWORD dwHighDateTime;
+} FILETIME;
+
+/* LARGE_INTEGER — 64비트 정수 (union) */
+typedef union {
+	struct {
+		DWORD LowPart;
+		LONG  HighPart;
+	};
+	int64_t QuadPart;
+} LARGE_INTEGER;
+
+/* ============================================================
+ * 파일 검색 타입
+ * ============================================================ */
+
+/* WIN32_FIND_DATAA — FindFirstFileA 결과 */
+typedef struct {
+	DWORD    dwFileAttributes;
+	FILETIME ftCreationTime;
+	FILETIME ftLastAccessTime;
+	FILETIME ftLastWriteTime;
+	DWORD    nFileSizeHigh;
+	DWORD    nFileSizeLow;
+	DWORD    dwReserved0;
+	DWORD    dwReserved1;
+	char     cFileName[MAX_PATH];
+	char     cAlternateFileName[14];
+} WIN32_FIND_DATAA;
+
+/* 파일 속성 상수 */
+#define FILE_ATTRIBUTE_READONLY   0x00000001
+#define FILE_ATTRIBUTE_DIRECTORY  0x00000010
+#define FILE_ATTRIBUTE_ARCHIVE    0x00000020
+#define INVALID_FILE_ATTRIBUTES   ((DWORD)-1)
+
+/* GetFileType 반환값 */
+#define FILE_TYPE_UNKNOWN  0x0000
+#define FILE_TYPE_DISK     0x0001
+#define FILE_TYPE_CHAR     0x0002
+#define FILE_TYPE_PIPE     0x0003
+
+/* ============================================================
+ * 시스템 정보 타입
+ * ============================================================ */
+
+/* SYSTEM_INFO */
+typedef struct {
+	uint16_t wProcessorArchitecture;
+	uint16_t wReserved;
+	DWORD    dwPageSize;
+	void    *lpMinimumApplicationAddress;
+	void    *lpMaximumApplicationAddress;
+	uintptr_t dwActiveProcessorMask;
+	DWORD    dwNumberOfProcessors;
+	DWORD    dwProcessorType;
+	DWORD    dwAllocationGranularity;
+	uint16_t wProcessorLevel;
+	uint16_t wProcessorRevision;
+} SYSTEM_INFO;
+
+/* OSVERSIONINFOA */
+typedef struct {
+	DWORD dwOSVersionInfoSize;
+	DWORD dwMajorVersion;
+	DWORD dwMinorVersion;
+	DWORD dwBuildNumber;
+	DWORD dwPlatformId;
+	char  szCSDVersion[128];
+} OSVERSIONINFOA;
+
+/* MEMORYSTATUS */
+typedef struct {
+	DWORD dwLength;
+	DWORD dwMemoryLoad;
+	uint64_t ullTotalPhys;
+	uint64_t ullAvailPhys;
+	uint64_t ullTotalPageFile;
+	uint64_t ullAvailPageFile;
+	uint64_t ullTotalVirtual;
+	uint64_t ullAvailVirtual;
+} MEMORYSTATUSEX;
+
+/* PROCESSOR_ARCHITECTURE */
+#define PROCESSOR_ARCHITECTURE_AMD64  9
+
+/* ============================================================
+ * XInput 타입 & 상수
+ * ============================================================ */
+
+/* XInput 버튼 비트마스크 */
+#define XINPUT_GAMEPAD_DPAD_UP        0x0001
+#define XINPUT_GAMEPAD_DPAD_DOWN      0x0002
+#define XINPUT_GAMEPAD_DPAD_LEFT      0x0004
+#define XINPUT_GAMEPAD_DPAD_RIGHT     0x0008
+#define XINPUT_GAMEPAD_START          0x0010
+#define XINPUT_GAMEPAD_BACK           0x0020
+#define XINPUT_GAMEPAD_LEFT_THUMB     0x0040
+#define XINPUT_GAMEPAD_RIGHT_THUMB    0x0080
+#define XINPUT_GAMEPAD_LEFT_SHOULDER  0x0100
+#define XINPUT_GAMEPAD_RIGHT_SHOULDER 0x0200
+#define XINPUT_GAMEPAD_A              0x1000
+#define XINPUT_GAMEPAD_B              0x2000
+#define XINPUT_GAMEPAD_X              0x4000
+#define XINPUT_GAMEPAD_Y              0x8000
+
+/* XInput 에러 코드 */
+#define ERROR_SUCCESS                 0
+#define ERROR_DEVICE_NOT_CONNECTED    0x048F
+
+/* XInput 디바이스 타입 */
+#define XINPUT_DEVTYPE_GAMEPAD        0x01
+#define XINPUT_DEVSUBTYPE_GAMEPAD     0x01
+
+/* XInput 최대 컨트롤러 수 */
+#define XUSER_MAX_COUNT               4
+
+typedef struct {
+	uint16_t wButtons;
+	uint8_t  bLeftTrigger;
+	uint8_t  bRightTrigger;
+	int16_t  sThumbLX;
+	int16_t  sThumbLY;
+	int16_t  sThumbRX;
+	int16_t  sThumbRY;
+} XINPUT_GAMEPAD;
+
+typedef struct {
+	uint32_t      dwPacketNumber;
+	XINPUT_GAMEPAD Gamepad;
+} XINPUT_STATE;
+
+typedef struct {
+	uint16_t wLeftMotorSpeed;
+	uint16_t wRightMotorSpeed;
+} XINPUT_VIBRATION;
+
+typedef struct {
+	uint8_t  Type;
+	uint8_t  SubType;
+	uint16_t Flags;
+	XINPUT_GAMEPAD Gamepad;
+	XINPUT_VIBRATION Vibration;
+} XINPUT_CAPABILITIES;
 
 #endif /* CITC_WIN32_H */

@@ -34,6 +34,26 @@
 /* 8x8 비트맵 폰트 (compositor와 공유) */
 #include "../../../../display/fbdraw/src/font8x8.h"
 
+/* PSF2 폰트 (Class 61) */
+#include "../../../../display/font/psf2.h"
+
+static struct psf2_font g_gdi_psf2;
+static int g_gdi_font_w = 8;
+static int g_gdi_font_h = 8;
+static int g_gdi_psf2_init = 0;
+
+/* PSF2 폰트 지연 로드 (최초 TextOut 호출 시) */
+static void gdi32_ensure_font(void)
+{
+	if (g_gdi_psf2_init)
+		return;
+	g_gdi_psf2_init = 1;
+	if (psf2_load(&g_gdi_psf2, "/usr/share/fonts/ter-116n.psf") == 0) {
+		g_gdi_font_w = (int)g_gdi_psf2.width;
+		g_gdi_font_h = (int)g_gdi_psf2.height;
+	}
+}
+
 /* ============================================================
  * Device Context 테이블
  * ============================================================
@@ -256,6 +276,8 @@ static int32_t g32_TextOutA(HDC hdc, int x, int y,
 	if (!dc || !dc->pixels || !text)
 		return FALSE;
 
+	gdi32_ensure_font();
+
 	uint32_t fg = colorref_to_pixel(dc->text_color);
 	uint32_t bg = colorref_to_pixel(dc->bk_color);
 
@@ -265,24 +287,44 @@ static int32_t g32_TextOutA(HDC hdc, int x, int y,
 		if (ch > 127)
 			ch = '?';
 
-		const uint8_t *glyph = (const uint8_t *)font8x8_basic[ch];
+		if (g_gdi_psf2.loaded) {
+			/* OPAQUE: 배경 먼저 채우기 */
+			if (dc->bk_mode == OPAQUE) {
+				for (int row = 0; row < g_gdi_font_h; row++) {
+					int py = y + row;
+					if (py < 0 || py >= dc->height)
+						continue;
+					for (int col = 0; col < g_gdi_font_w; col++) {
+						int px = x + c * g_gdi_font_w + col;
+						if (px >= 0 && px < dc->width)
+							dc->pixels[py * dc->width + px] = bg;
+					}
+				}
+			}
+			psf2_draw_char(dc->pixels, dc->width,
+				       x + c * g_gdi_font_w, y,
+				       (char)ch, fg, &g_gdi_psf2);
+		} else {
+			const uint8_t *glyph =
+				(const uint8_t *)font8x8_basic[ch];
 
-		for (int row = 0; row < 8; row++) {
-			int py = y + row;
+			for (int row = 0; row < 8; row++) {
+				int py = y + row;
 
-			if (py < 0 || py >= dc->height)
-				continue;
-
-			for (int col = 0; col < 8; col++) {
-				int px = x + c * 8 + col;
-
-				if (px < 0 || px >= dc->width)
+				if (py < 0 || py >= dc->height)
 					continue;
 
-				if (glyph[row] & (1 << col)) {
-					dc->pixels[py * dc->width + px] = fg;
-				} else if (dc->bk_mode == OPAQUE) {
-					dc->pixels[py * dc->width + px] = bg;
+				for (int col = 0; col < 8; col++) {
+					int px = x + c * 8 + col;
+
+					if (px < 0 || px >= dc->width)
+						continue;
+
+					if (glyph[row] & (1 << col)) {
+						dc->pixels[py * dc->width + px] = fg;
+					} else if (dc->bk_mode == OPAQUE) {
+						dc->pixels[py * dc->width + px] = bg;
+					}
 				}
 			}
 		}
@@ -548,7 +590,9 @@ static int g32_DrawTextA(HDC hdc, const char *text, int count,
 			count++;
 	}
 
-	int font_w = 8, font_h = 8;
+	gdi32_ensure_font();
+
+	int font_w = g_gdi_font_w, font_h = g_gdi_font_h;
 	int text_w = count * font_w;
 	int text_h = font_h;
 
@@ -589,24 +633,43 @@ static int g32_DrawTextA(HDC hdc, const char *text, int count,
 		if (ch > 127)
 			ch = '?';
 
-		const uint8_t *glyph = (const uint8_t *)font8x8_basic[ch];
+		if (g_gdi_psf2.loaded) {
+			if (dc->bk_mode == OPAQUE) {
+				for (int row = 0; row < font_h; row++) {
+					int py = y + row;
+					if (py < 0 || py >= dc->height)
+						continue;
+					for (int col = 0; col < font_w; col++) {
+						int px2 = x + c * font_w + col;
+						if (px2 >= 0 && px2 < dc->width)
+							dc->pixels[py * dc->width + px2] = bg;
+					}
+				}
+			}
+			psf2_draw_char(dc->pixels, dc->width,
+				       x + c * font_w, y,
+				       (char)ch, fg, &g_gdi_psf2);
+		} else {
+			const uint8_t *glyph =
+				(const uint8_t *)font8x8_basic[ch];
 
-		for (int row = 0; row < 8; row++) {
-			int py = y + row;
+			for (int row = 0; row < 8; row++) {
+				int py = y + row;
 
-			if (py < 0 || py >= dc->height)
-				continue;
-
-			for (int col = 0; col < 8; col++) {
-				int px = x + c * 8 + col;
-
-				if (px < 0 || px >= dc->width)
+				if (py < 0 || py >= dc->height)
 					continue;
 
-				if (glyph[row] & (1 << col)) {
-					dc->pixels[py * dc->width + px] = fg;
-				} else if (dc->bk_mode == OPAQUE) {
-					dc->pixels[py * dc->width + px] = bg;
+				for (int col = 0; col < 8; col++) {
+					int px2 = x + c * 8 + col;
+
+					if (px2 < 0 || px2 >= dc->width)
+						continue;
+
+					if (glyph[row] & (1 << col)) {
+						dc->pixels[py * dc->width + px2] = fg;
+					} else if (dc->bk_mode == OPAQUE) {
+						dc->pixels[py * dc->width + px2] = bg;
+					}
 				}
 			}
 		}
@@ -629,12 +692,14 @@ static int32_t g32_GetTextMetricsA(HDC hdc, TEXTMETRICA *tm)
 	if (!tm)
 		return FALSE;
 
+	gdi32_ensure_font();
+
 	memset(tm, 0, sizeof(*tm));
-	tm->tmHeight = 8;
-	tm->tmAscent = 7;
+	tm->tmHeight = g_gdi_font_h;
+	tm->tmAscent = g_gdi_font_h - 1;
 	tm->tmDescent = 1;
-	tm->tmAveCharWidth = 8;
-	tm->tmMaxCharWidth = 8;
+	tm->tmAveCharWidth = g_gdi_font_w;
+	tm->tmMaxCharWidth = g_gdi_font_w;
 	tm->tmWeight = 400;        /* FW_NORMAL */
 	tm->tmFirstChar = 0x20;    /* space */
 	tm->tmLastChar = 0x7E;     /* tilde */

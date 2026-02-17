@@ -38,8 +38,14 @@
 #include "../dlls/gdi32/gdi32.h"
 #include "../dlls/dxgi/dxgi.h"
 #include "../dlls/d3d11/d3d11.h"
+#include "../dlls/dsound/dsound.h"
+#include "../dlls/xaudio2/xaudio2.h"
+#include "../dlls/xinput/xinput.h"
 #include "../ntemu/ntdll.h"
 #include "../ntemu/registry.h"
+#include "../dlls/ole32/ole32.h"
+#include "../dlls/ws2_32/ws2_32.h"
+#include "../dlls/d3d12/d3d12.h"
 
 /* ============================================================
  * 1. PE 파일 읽기 & 검증
@@ -504,8 +510,14 @@ static struct stub_entry *all_stub_tables[] = {
 	gdi32_stub_table,
 	dxgi_stub_table,
 	d3d11_stub_table,
+	dsound_stub_table,
+	xaudio2_stub_table,
+	xinput_stub_table,
 	ntdll_stub_table,
 	advapi32_stub_table,
+	ole32_stub_table,
+	ws2_32_stub_table,
+	d3d12_stub_table,
 	NULL
 };
 
