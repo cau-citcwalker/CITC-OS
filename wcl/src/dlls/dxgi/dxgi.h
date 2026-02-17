@@ -39,6 +39,9 @@ int dxgi_get_swapchain_backbuffer(void *pSwapChain, uint32_t **pixels,
 /* SwapChain의 백버퍼 인덱스 설정 (d3d11 리소스와 연동) */
 void dxgi_set_swapchain_resource(void *pSwapChain, int resource_idx);
 
+/* SwapChain이면 연동된 리소스 인덱스 반환 (-1 = 미연동 또는 SwapChain 아님) */
+int dxgi_get_swapchain_resource_idx(void *pSwapChain);
+
 /*
  * 내부 API — D3D11CreateDeviceAndSwapChain에서 사용
  *

@@ -38,6 +38,10 @@
 #include "../../../include/d3d11_types.h"
 #include "../../../include/stub_entry.h"
 #include "../dxgi/dxgi.h"
+#include "dxbc.h"
+#include "spirv_emit.h"
+#include "shader_cache.h"
+#include "vk_backend.h"
 
 /* ============================================================
  * 핸들 오프셋
@@ -46,6 +50,8 @@
 #define DX_VIEW_OFFSET      0x53000
 #define DX_SHADER_OFFSET    0x54000
 #define DX_LAYOUT_OFFSET    0x56000
+#define DX_STATE_OFFSET     0x57000
+#define DX_SAMPLER_OFFSET   0x58000
 
 /* ============================================================
  * 리소스 테이블 (gdi32 패턴)
@@ -75,6 +81,7 @@ struct d3d_resource {
 	int width, height;
 	DXGI_FORMAT format;
 	uint32_t *pixels;       /* XRGB8888 (렌더 타깃일 때) */
+	float *depth;           /* D32_FLOAT 깊이 버퍼 */
 
 	/* SwapChain 연동 */
 	int is_swapchain_buffer; /* 1이면 pixels는 SwapChain 소유 */
@@ -164,6 +171,10 @@ struct d3d_shader {
 	enum d3d_shader_type type;
 	void *bytecode;
 	size_t bytecode_size;
+	struct dxbc_info dxbc;  /* DXBC 파싱 결과 */
+	/* SPIR-V 변환 결과 (Class 43-44) */
+	uint32_t *spirv;
+	size_t spirv_size;
 };
 
 static struct d3d_shader shader_table[MAX_D3D_SHADERS];
@@ -215,6 +226,88 @@ static int handle_to_layout_idx(void *handle)
 	int idx = (int)(val - DX_LAYOUT_OFFSET);
 	if (idx < 0 || idx >= MAX_D3D_LAYOUTS) return -1;
 	if (!layout_table[idx].active) return -1;
+	return idx;
+}
+
+/* ============================================================
+ * 상태 오브젝트 테이블 (DepthStencil, Blend, Rasterizer)
+ * ============================================================ */
+#define MAX_D3D_STATES 64
+
+enum d3d_state_type {
+	D3D_STATE_FREE = 0,
+	D3D_STATE_DEPTH_STENCIL,
+	D3D_STATE_BLEND,
+	D3D_STATE_RASTERIZER,
+};
+
+struct d3d_state {
+	int active;
+	enum d3d_state_type type;
+	union {
+		D3D11_DEPTH_STENCIL_DESC ds;
+		D3D11_BLEND_DESC blend;
+		D3D11_RASTERIZER_DESC rs;
+	};
+};
+
+static struct d3d_state state_table[MAX_D3D_STATES];
+
+static int alloc_state(void)
+{
+	for (int i = 0; i < MAX_D3D_STATES; i++)
+		if (!state_table[i].active)
+			return i;
+	return -1;
+}
+
+static void *state_to_handle(int idx)
+{
+	return (void *)(uintptr_t)(idx + DX_STATE_OFFSET);
+}
+
+static int handle_to_state_idx(void *handle)
+{
+	uintptr_t val = (uintptr_t)handle;
+	if (val < DX_STATE_OFFSET) return -1;
+	int idx = (int)(val - DX_STATE_OFFSET);
+	if (idx < 0 || idx >= MAX_D3D_STATES) return -1;
+	if (!state_table[idx].active) return -1;
+	return idx;
+}
+
+/* ============================================================
+ * 샘플러 테이블
+ * ============================================================ */
+#define MAX_D3D_SAMPLERS 32
+
+struct d3d_sampler {
+	int active;
+	D3D11_SAMPLER_DESC desc;
+};
+
+static struct d3d_sampler sampler_table[MAX_D3D_SAMPLERS];
+
+static int alloc_sampler(void)
+{
+	for (int i = 0; i < MAX_D3D_SAMPLERS; i++)
+		if (!sampler_table[i].active)
+			return i;
+	return -1;
+}
+
+static void *sampler_to_handle(int idx)
+{
+	return (void *)(uintptr_t)(idx + DX_SAMPLER_OFFSET);
+}
+
+static int handle_to_sampler_idx(void *handle)
+{
+	uintptr_t val = (uintptr_t)handle;
+	if (val < DX_SAMPLER_OFFSET) return -1;
+	int idx = (int)(val - DX_SAMPLER_OFFSET);
+	if (idx < 0 || idx >= MAX_D3D_SAMPLERS) return -1;
+	if (!sampler_table[idx].active) return -1;
 	return idx;
 }
 
@@ -316,14 +409,26 @@ dev_CreateTexture2D(void *This, const D3D11_TEXTURE2D_DESC *pDesc,
 	r->format = pDesc->Format;
 
 	size_t pixel_count = (size_t)pDesc->Width * pDesc->Height;
-	r->pixels = calloc(pixel_count, sizeof(uint32_t));
-	if (!r->pixels) { r->active = 0; return E_OUTOFMEMORY; }
 
-	r->data = r->pixels;
-	r->size = pixel_count * 4;
+	if (pDesc->Format == DXGI_FORMAT_D32_FLOAT) {
+		/* 깊이 버퍼: float 배열, 1.0f로 초기화 */
+		r->depth = malloc(pixel_count * sizeof(float));
+		if (!r->depth) { r->active = 0; return E_OUTOFMEMORY; }
+		for (size_t i = 0; i < pixel_count; i++)
+			r->depth[i] = 1.0f;
+		r->data = r->depth;
+		r->size = pixel_count * sizeof(float);
+		r->pixels = NULL;
+	} else {
+		r->pixels = calloc(pixel_count, sizeof(uint32_t));
+		if (!r->pixels) { r->active = 0; return E_OUTOFMEMORY; }
+		r->data = r->pixels;
+		r->size = pixel_count * 4;
+		r->depth = NULL;
 
-	if (pInitialData && pInitialData->pSysMem)
-		memcpy(r->pixels, pInitialData->pSysMem, r->size);
+		if (pInitialData && pInitialData->pSysMem)
+			memcpy(r->pixels, pInitialData->pSysMem, r->size);
+	}
 
 	*ppTexture2D = resource_to_handle(idx);
 	return S_OK;
@@ -334,10 +439,27 @@ static HRESULT __attribute__((ms_abi))
 dev_CreateTexture3D(void *T, void *d, void *i, void **pp)
 { (void)T; (void)d; (void)i; (void)pp; return E_FAIL; }
 
-/* CreateShaderResourceView — 스텁 */
+/* CreateShaderResourceView */
 static HRESULT __attribute__((ms_abi))
-dev_CreateShaderResourceView(void *T, void *r, void *d, void **pp)
-{ (void)T; (void)r; (void)d; if (pp) *pp = NULL; return E_FAIL; }
+dev_CreateShaderResourceView(void *This, void *pResource,
+			     void *pDesc, void **ppSRView)
+{
+	(void)This; (void)pDesc;
+	if (!ppSRView) return E_POINTER;
+
+	int res_idx = handle_to_resource_idx(pResource);
+	if (res_idx < 0) return E_INVALIDARG;
+
+	int vidx = alloc_view();
+	if (vidx < 0) return E_OUTOFMEMORY;
+
+	view_table[vidx].active = 1;
+	view_table[vidx].type = D3D_VIEW_SRV;
+	view_table[vidx].resource_idx = res_idx;
+
+	*ppSRView = view_to_handle(vidx);
+	return S_OK;
+}
 
 /* CreateUnorderedAccessView — 스텁 */
 static HRESULT __attribute__((ms_abi))
@@ -398,10 +520,27 @@ dev_CreateRenderTargetView(void *This, void *pResource,
 	return S_OK;
 }
 
-/* CreateDepthStencilView — 스텁 */
+/* CreateDepthStencilView */
 static HRESULT __attribute__((ms_abi))
-dev_CreateDepthStencilView(void *T, void *r, void *d, void **pp)
-{ (void)T; (void)r; (void)d; if (pp) *pp = NULL; return E_FAIL; }
+dev_CreateDepthStencilView(void *This, void *pResource,
+			   void *pDesc, void **ppDSView)
+{
+	(void)This; (void)pDesc;
+	if (!ppDSView) return E_POINTER;
+
+	int res_idx = handle_to_resource_idx(pResource);
+	if (res_idx < 0) return E_INVALIDARG;
+
+	int vidx = alloc_view();
+	if (vidx < 0) return E_OUTOFMEMORY;
+
+	view_table[vidx].active = 1;
+	view_table[vidx].type = D3D_VIEW_DSV;
+	view_table[vidx].resource_idx = res_idx;
+
+	*ppDSView = view_to_handle(vidx);
+	return S_OK;
+}
 
 /* CreateInputLayout */
 static HRESULT __attribute__((ms_abi))
@@ -446,10 +585,33 @@ dev_CreateVertexShader(void *This, const void *pBytecode, size_t Length,
 	shader_table[idx].type = D3D_SHADER_VERTEX;
 	shader_table[idx].bytecode_size = Length;
 	shader_table[idx].bytecode = NULL;
+	shader_table[idx].spirv = NULL;
+	shader_table[idx].spirv_size = 0;
+	memset(&shader_table[idx].dxbc, 0, sizeof(struct dxbc_info));
 	if (pBytecode && Length > 0) {
 		shader_table[idx].bytecode = malloc(Length);
-		if (shader_table[idx].bytecode)
+		if (shader_table[idx].bytecode) {
 			memcpy(shader_table[idx].bytecode, pBytecode, Length);
+			dxbc_parse(shader_table[idx].bytecode, Length,
+				   &shader_table[idx].dxbc);
+			/* Shader cache 조회 (Class 53) */
+			if (shader_table[idx].dxbc.valid) {
+				if (shader_cache_lookup(
+					    pBytecode, Length,
+					    &shader_table[idx].spirv,
+					    &shader_table[idx].spirv_size) != 0) {
+					/* 캐시 미스 → 컴파일 + 저장 */
+					dxbc_to_spirv(&shader_table[idx].dxbc,
+						      &shader_table[idx].spirv,
+						      &shader_table[idx].spirv_size);
+					if (shader_table[idx].spirv)
+						shader_cache_store(
+							pBytecode, Length,
+							shader_table[idx].spirv,
+							shader_table[idx].spirv_size);
+				}
+			}
+		}
 	}
 
 	*ppVertexShader = shader_to_handle(idx);
@@ -487,13 +649,110 @@ dev_CreatePixelShader(void *This, const void *pBytecode, size_t Length,
 	shader_table[idx].type = D3D_SHADER_PIXEL;
 	shader_table[idx].bytecode_size = Length;
 	shader_table[idx].bytecode = NULL;
+	shader_table[idx].spirv = NULL;
+	shader_table[idx].spirv_size = 0;
+	memset(&shader_table[idx].dxbc, 0, sizeof(struct dxbc_info));
 	if (pBytecode && Length > 0) {
 		shader_table[idx].bytecode = malloc(Length);
-		if (shader_table[idx].bytecode)
+		if (shader_table[idx].bytecode) {
 			memcpy(shader_table[idx].bytecode, pBytecode, Length);
+			dxbc_parse(shader_table[idx].bytecode, Length,
+				   &shader_table[idx].dxbc);
+			/* Shader cache 조회 (Class 53) */
+			if (shader_table[idx].dxbc.valid) {
+				if (shader_cache_lookup(
+					    pBytecode, Length,
+					    &shader_table[idx].spirv,
+					    &shader_table[idx].spirv_size) != 0) {
+					dxbc_to_spirv(&shader_table[idx].dxbc,
+						      &shader_table[idx].spirv,
+						      &shader_table[idx].spirv_size);
+					if (shader_table[idx].spirv)
+						shader_cache_store(
+							pBytecode, Length,
+							shader_table[idx].spirv,
+							shader_table[idx].spirv_size);
+				}
+			}
+		}
 	}
 
 	*ppPixelShader = shader_to_handle(idx);
+	return S_OK;
+}
+
+/* CreateDepthStencilState */
+static HRESULT __attribute__((ms_abi))
+dev_CreateDepthStencilState(void *This, const D3D11_DEPTH_STENCIL_DESC *pDesc,
+			    void **ppDepthStencilState)
+{
+	(void)This;
+	if (!pDesc || !ppDepthStencilState) return E_POINTER;
+
+	int idx = alloc_state();
+	if (idx < 0) return E_OUTOFMEMORY;
+
+	state_table[idx].active = 1;
+	state_table[idx].type = D3D_STATE_DEPTH_STENCIL;
+	state_table[idx].ds = *pDesc;
+
+	*ppDepthStencilState = state_to_handle(idx);
+	return S_OK;
+}
+
+/* CreateBlendState */
+static HRESULT __attribute__((ms_abi))
+dev_CreateBlendState(void *This, const D3D11_BLEND_DESC *pDesc,
+		     void **ppBlendState)
+{
+	(void)This;
+	if (!pDesc || !ppBlendState) return E_POINTER;
+
+	int idx = alloc_state();
+	if (idx < 0) return E_OUTOFMEMORY;
+
+	state_table[idx].active = 1;
+	state_table[idx].type = D3D_STATE_BLEND;
+	state_table[idx].blend = *pDesc;
+
+	*ppBlendState = state_to_handle(idx);
+	return S_OK;
+}
+
+/* CreateRasterizerState */
+static HRESULT __attribute__((ms_abi))
+dev_CreateRasterizerState(void *This, const D3D11_RASTERIZER_DESC *pDesc,
+			  void **ppRasterizerState)
+{
+	(void)This;
+	if (!pDesc || !ppRasterizerState) return E_POINTER;
+
+	int idx = alloc_state();
+	if (idx < 0) return E_OUTOFMEMORY;
+
+	state_table[idx].active = 1;
+	state_table[idx].type = D3D_STATE_RASTERIZER;
+	state_table[idx].rs = *pDesc;
+
+	*ppRasterizerState = state_to_handle(idx);
+	return S_OK;
+}
+
+/* CreateSamplerState */
+static HRESULT __attribute__((ms_abi))
+dev_CreateSamplerState(void *This, const D3D11_SAMPLER_DESC *pDesc,
+		       void **ppSamplerState)
+{
+	(void)This;
+	if (!pDesc || !ppSamplerState) return E_POINTER;
+
+	int idx = alloc_sampler();
+	if (idx < 0) return E_OUTOFMEMORY;
+
+	sampler_table[idx].active = 1;
+	sampler_table[idx].desc = *pDesc;
+
+	*ppSamplerState = sampler_to_handle(idx);
 	return S_OK;
 }
 
@@ -516,6 +775,20 @@ dev_GetImmediateContext(void *This, void **ppContext);
 /* forward declaration — context 생성 후 설정 */
 static struct d3d11_context *g_context;
 
+/* ============================================================
+ * Vulkan GPU 백엔드 전역 상태 (Class 41-44)
+ * ============================================================ */
+#ifdef CITC_VULKAN_ENABLED
+#include "vk_pipeline.h"
+static int use_vulkan;                   /* 1이면 GPU 가속 활성 */
+static struct vk_backend g_vk;           /* Vulkan 디바이스 */
+static struct vk_render_target g_vk_rt;  /* 렌더 타깃 (SwapChain 연동) */
+static struct vk_pipeline_cache g_vk_pcache; /* 파이프라인 캐시 (Class 44) */
+static struct vk_gpu_buffer g_vk_vb;     /* 임시 VB */
+static struct vk_gpu_buffer g_vk_ib;     /* 임시 IB */
+static struct vk_gpu_buffer g_vk_ubo;    /* 임시 UBO */
+#endif
+
 static ID3D11DeviceVtbl g_device_vtbl = {
 	.QueryInterface                = dev_QueryInterface,
 	.AddRef                        = dev_AddRef,
@@ -535,10 +808,10 @@ static ID3D11DeviceVtbl g_device_vtbl = {
 	.CreateGeometryShader          = dev_CreateGeometryShader,
 	.CreateGeometryShaderWithStreamOutput = dev_CreateGeometryShaderWithStreamOutput,
 	.CreatePixelShader             = dev_CreatePixelShader,
-	.CreateBlendState              = (void *)dev_stub_hr,
-	.CreateDepthStencilState       = (void *)dev_stub_hr,
-	.CreateRasterizerState         = (void *)dev_stub_hr,
-	.CreateSamplerState            = (void *)dev_stub_hr,
+	.CreateBlendState              = (void *)dev_CreateBlendState,
+	.CreateDepthStencilState       = (void *)dev_CreateDepthStencilState,
+	.CreateRasterizerState         = (void *)dev_CreateRasterizerState,
+	.CreateSamplerState            = (void *)dev_CreateSamplerState,
 	.CreateQuery                   = (void *)dev_stub_hr,
 	.CreatePredicate               = (void *)dev_stub_hr,
 	.CreateCounter                 = (void *)dev_stub_hr,
@@ -579,9 +852,23 @@ struct d3d11_context {
 	/* 셰이더 스테이지 */
 	int vs_idx, ps_idx;
 
+	/* Constant Buffer 슬롯 */
+	int vs_cb_idx[8];   /* resource_table 인덱스, -1 = unbound */
+	int ps_cb_idx[8];
+
 	/* OM 스테이지 */
 	int rtv_idx;
 	int dsv_idx;
+
+	/* PS 리소스 슬롯 */
+	int ps_srv_idx[8];     /* view_table 인덱스, -1 = unbound */
+	int ps_sampler_idx[8]; /* sampler_table 인덱스, -1 = unbound */
+
+	/* 상태 오브젝트 인덱스 (state_table, -1 = 기본값) */
+	int ds_state_idx;   /* DepthStencil */
+	int blend_state_idx;
+	int rs_state_idx;   /* Rasterizer */
+	UINT stencil_ref;
 
 	/* RS 스테이지 */
 	D3D11_VIEWPORT viewport;
@@ -619,8 +906,18 @@ ctx_SetPrivateDataInterface(void *T, REFIID g, void *d)
 
 /* VS 스테이지 */
 static void __attribute__((ms_abi))
-ctx_VSSetConstantBuffers(void *T, UINT s, UINT n, void *const *pp)
-{ (void)T; (void)s; (void)n; (void)pp; }
+ctx_VSSetConstantBuffers(void *This, UINT StartSlot, UINT NumBuffers,
+			 void *const *ppConstantBuffers)
+{
+	struct d3d11_context *c = This;
+	for (UINT i = 0; i < NumBuffers && (StartSlot + i) < 8; i++) {
+		if (ppConstantBuffers && ppConstantBuffers[i])
+			c->vs_cb_idx[StartSlot + i] =
+				handle_to_resource_idx(ppConstantBuffers[i]);
+		else
+			c->vs_cb_idx[StartSlot + i] = -1;
+	}
+}
 
 static void __attribute__((ms_abi))
 ctx_VSSetShader(void *This, void *pVS, void *const *ppCI, UINT nCI)
@@ -633,11 +930,31 @@ ctx_VSSetShader(void *This, void *pVS, void *const *ppCI, UINT nCI)
 
 /* PS 스테이지 */
 static void __attribute__((ms_abi))
-ctx_PSSetShaderResources(void *T, UINT s, UINT n, void *const *pp)
-{ (void)T; (void)s; (void)n; (void)pp; }
+ctx_PSSetShaderResources(void *This, UINT StartSlot, UINT NumViews,
+			 void *const *ppSRViews)
+{
+	struct d3d11_context *c = This;
+	for (UINT i = 0; i < NumViews && (StartSlot + i) < 8; i++) {
+		if (ppSRViews && ppSRViews[i])
+			c->ps_srv_idx[StartSlot + i] =
+				handle_to_view_idx(ppSRViews[i]);
+		else
+			c->ps_srv_idx[StartSlot + i] = -1;
+	}
+}
 static void __attribute__((ms_abi))
-ctx_PSSetSamplers(void *T, UINT s, UINT n, void *const *pp)
-{ (void)T; (void)s; (void)n; (void)pp; }
+ctx_PSSetSamplers(void *This, UINT StartSlot, UINT NumSamplers,
+		  void *const *ppSamplers)
+{
+	struct d3d11_context *c = This;
+	for (UINT i = 0; i < NumSamplers && (StartSlot + i) < 8; i++) {
+		if (ppSamplers && ppSamplers[i])
+			c->ps_sampler_idx[StartSlot + i] =
+				handle_to_sampler_idx(ppSamplers[i]);
+		else
+			c->ps_sampler_idx[StartSlot + i] = -1;
+	}
+}
 
 static void __attribute__((ms_abi))
 ctx_PSSetShader(void *This, void *pPS, void *const *ppCI, UINT nCI)
@@ -698,11 +1015,41 @@ ctx_OMSetRenderTargets(void *This, UINT NumViews,
 		       void *pDepthStencilView)
 {
 	struct d3d11_context *c = This;
-	(void)pDepthStencilView;
 	if (ppRenderTargetViews && NumViews > 0 && ppRenderTargetViews[0])
 		c->rtv_idx = handle_to_view_idx(ppRenderTargetViews[0]);
 	else
 		c->rtv_idx = -1;
+
+	if (pDepthStencilView)
+		c->dsv_idx = handle_to_view_idx(pDepthStencilView);
+	else
+		c->dsv_idx = -1;
+}
+
+/* OM 상태 바인딩 */
+static void __attribute__((ms_abi))
+ctx_OMSetDepthStencilState(void *This, void *pState, UINT StencilRef)
+{
+	struct d3d11_context *c = This;
+	c->ds_state_idx = pState ? handle_to_state_idx(pState) : -1;
+	c->stencil_ref = StencilRef;
+}
+
+static void __attribute__((ms_abi))
+ctx_OMSetBlendState(void *This, void *pState,
+		    const float BlendFactor[4], UINT SampleMask)
+{
+	struct d3d11_context *c = This;
+	(void)BlendFactor; (void)SampleMask;
+	c->blend_state_idx = pState ? handle_to_state_idx(pState) : -1;
+}
+
+/* RS 상태 바인딩 */
+static void __attribute__((ms_abi))
+ctx_RSSetState(void *This, void *pState)
+{
+	struct d3d11_context *c = This;
+	c->rs_state_idx = pState ? handle_to_state_idx(pState) : -1;
 }
 
 /* RS 스테이지 */
@@ -739,6 +1086,14 @@ ctx_ClearRenderTargetView(void *This, void *pRenderTargetView,
 	int count = r->width * r->height;
 	for (int i = 0; i < count; i++)
 		r->pixels[i] = c;
+
+#ifdef CITC_VULKAN_ENABLED
+	/* GPU도 같이 clear (Class 42에서 GPU Draw 시 사용) */
+	if (use_vulkan && g_vk_rt.active)
+		vk_clear_color(&g_vk, &g_vk_rt,
+			       ColorRGBA[0], ColorRGBA[1],
+			       ColorRGBA[2], ColorRGBA[3]);
+#endif
 }
 
 /* Map/Unmap — 리소스 CPU 접근 */
@@ -751,6 +1106,11 @@ ctx_Map(void *This, void *pResource, UINT Subresource,
 	if (!pMapped) return E_POINTER;
 
 	int idx = handle_to_resource_idx(pResource);
+
+	/* SwapChain의 GetBuffer()가 반환한 포인터일 수 있음 */
+	if (idx < 0)
+		idx = dxgi_get_swapchain_resource_idx(pResource);
+
 	if (idx < 0) return E_INVALIDARG;
 
 	struct d3d_resource *r = &resource_table[idx];
@@ -764,6 +1124,44 @@ ctx_Map(void *This, void *pResource, UINT Subresource,
 static void __attribute__((ms_abi))
 ctx_Unmap(void *This, void *pResource, UINT Subresource)
 { (void)This; (void)pResource; (void)Subresource; }
+
+/* UpdateSubresource — USAGE_DEFAULT 리소스에 CPU 데이터 복사 */
+static void __attribute__((ms_abi))
+ctx_UpdateSubresource(void *This, void *pDstResource, UINT DstSubresource,
+		      void *pDstBox, const void *pSrcData,
+		      UINT SrcRowPitch, UINT SrcDepthPitch)
+{
+	(void)This; (void)DstSubresource; (void)pDstBox;
+	(void)SrcRowPitch; (void)SrcDepthPitch;
+	if (!pSrcData) return;
+
+	int idx = handle_to_resource_idx(pDstResource);
+	if (idx < 0) return;
+
+	struct d3d_resource *r = &resource_table[idx];
+	if (r->data && r->size > 0)
+		memcpy(r->data, pSrcData, r->size);
+}
+
+/* ClearDepthStencilView — 깊이/스텐실 버퍼 초기화 */
+static void __attribute__((ms_abi))
+ctx_ClearDepthStencilView(void *This, void *pDSView,
+			  UINT ClearFlags, float Depth, uint8_t Stencil)
+{
+	(void)This; (void)Stencil;
+	int vidx = handle_to_view_idx(pDSView);
+	if (vidx < 0) return;
+
+	int ridx = view_table[vidx].resource_idx;
+	if (ridx < 0 || ridx >= MAX_D3D_RESOURCES) return;
+
+	struct d3d_resource *r = &resource_table[ridx];
+	if ((ClearFlags & D3D11_CLEAR_DEPTH) && r->depth) {
+		int count = r->width * r->height;
+		for (int i = 0; i < count; i++)
+			r->depth[i] = Depth;
+	}
+}
 
 /* ============================================================
  * 소프트웨어 래스터라이저
@@ -779,9 +1177,28 @@ ctx_Unmap(void *This, void *pResource, UINT Subresource)
  *   5. 렌더 타깃에 쓰기
  */
 
+/*
+ * 4x4 행렬 × float4 벡터 곱셈
+ *
+ * D3D11 HLSL: mul(vector, matrix) = row-vector × matrix.
+ * C에서 행렬은 row-major 순서로 저장:
+ *   m[0..3] = row0, m[4..7] = row1, ...
+ * mul(v, M) = { dot(v, col0), dot(v, col1), dot(v, col2), dot(v, col3) }
+ */
+static void mat4_mul_vec4(const float m[16], const float v[4], float out[4])
+{
+	for (int c = 0; c < 4; c++) {
+		out[c] = 0.0f;
+		for (int r = 0; r < 4; r++)
+			out[c] += v[r] * m[r * 4 + c];
+	}
+}
+
 struct sw_vertex {
-	float pos[4];   /* x, y, z, w (NDC) */
-	float color[4]; /* r, g, b, a */
+	float pos[4];      /* x, y, z, w (NDC / clip space) */
+	float color[4];    /* r, g, b, a */
+	float texcoord[2]; /* u, v */
+	int has_texcoord;
 };
 
 /* edge function: 점 P가 엣지 AB의 어느 쪽에 있는지 */
@@ -791,20 +1208,113 @@ static float edge_func(float ax, float ay, float bx, float by,
 	return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
 }
 
-static void rasterize_triangle(struct d3d_resource *rt,
-			       const D3D11_VIEWPORT *vp,
+/* 텍스처 주소 모드 적용 */
+static float apply_address_mode(float coord, D3D11_TEXTURE_ADDRESS_MODE mode)
+{
+	switch (mode) {
+	case D3D11_TEXTURE_ADDRESS_WRAP:
+		coord = coord - floorf(coord); /* fmod → [0,1) */
+		break;
+	case D3D11_TEXTURE_ADDRESS_MIRROR: {
+		float t = coord - floorf(coord);
+		int period = (int)floorf(coord);
+		if (period & 1) t = 1.0f - t;
+		coord = t;
+		break;
+	}
+	case D3D11_TEXTURE_ADDRESS_CLAMP:
+	default:
+		if (coord < 0.0f) coord = 0.0f;
+		if (coord > 1.0f) coord = 1.0f;
+		break;
+	}
+	return coord;
+}
+
+/* UV → 텍셀 샘플링 (POINT 필터링) */
+static void sample_texture(const struct d3d_resource *tex,
+			   const D3D11_SAMPLER_DESC *samp,
+			   float u, float v, float out[4])
+{
+	if (!tex || !tex->pixels) {
+		out[0] = out[1] = out[2] = out[3] = 1.0f;
+		return;
+	}
+
+	D3D11_TEXTURE_ADDRESS_MODE addr_u = D3D11_TEXTURE_ADDRESS_CLAMP;
+	D3D11_TEXTURE_ADDRESS_MODE addr_v = D3D11_TEXTURE_ADDRESS_CLAMP;
+	if (samp) {
+		addr_u = samp->AddressU;
+		addr_v = samp->AddressV;
+	}
+
+	u = apply_address_mode(u, addr_u);
+	v = apply_address_mode(v, addr_v);
+
+	int tx = (int)(u * (tex->width  - 1) + 0.5f);
+	int ty = (int)(v * (tex->height - 1) + 0.5f);
+	if (tx < 0) tx = 0;
+	if (tx >= tex->width)  tx = tex->width - 1;
+	if (ty < 0) ty = 0;
+	if (ty >= tex->height) ty = tex->height - 1;
+
+	uint32_t pixel = tex->pixels[ty * tex->width + tx];
+	/* XRGB8888 → float4 */
+	out[0] = (float)((pixel >> 16) & 0xFF) / 255.0f;
+	out[1] = (float)((pixel >>  8) & 0xFF) / 255.0f;
+	out[2] = (float)((pixel >>  0) & 0xFF) / 255.0f;
+	out[3] = 1.0f;
+}
+
+/* 래스터라이저 파라미터 */
+struct raster_params {
+	struct d3d_resource *rt;
+	const D3D11_VIEWPORT *vp;
+	/* 깊이 테스트 */
+	float *depth_buf;          /* NULL이면 깊이 테스트 안함 */
+	int depth_enable;
+	int depth_write;
+	D3D11_COMPARISON_FUNC depth_func;
+	/* 컬링 */
+	D3D11_CULL_MODE cull_mode;
+	/* 텍스처 */
+	const struct d3d_resource *texture;  /* NULL이면 텍스처 없음 */
+	const D3D11_SAMPLER_DESC *sampler;   /* NULL이면 기본 */
+	/* PS 셰이더 VM */
+	const struct dxbc_info *ps_dxbc;     /* NULL이면 고정 함수 */
+	const float *ps_cb[4];              /* PS 상수 버퍼 */
+	int ps_cb_size[4];
+};
+
+/* 비교 함수 평가 */
+static int depth_compare(D3D11_COMPARISON_FUNC func, float src, float dst)
+{
+	switch (func) {
+	case D3D11_COMPARISON_NEVER:         return 0;
+	case D3D11_COMPARISON_LESS:          return src < dst;
+	case D3D11_COMPARISON_EQUAL:         return fabsf(src - dst) < 1e-6f;
+	case D3D11_COMPARISON_LESS_EQUAL:    return src <= dst;
+	case D3D11_COMPARISON_GREATER:       return src > dst;
+	case D3D11_COMPARISON_NOT_EQUAL:     return fabsf(src - dst) >= 1e-6f;
+	case D3D11_COMPARISON_GREATER_EQUAL: return src >= dst;
+	case D3D11_COMPARISON_ALWAYS:        return 1;
+	default:                             return 1;
+	}
+}
+
+static void rasterize_triangle(const struct raster_params *p,
 			       const struct sw_vertex v[3])
 {
-	if (!rt || !rt->pixels) return;
+	if (!p->rt || !p->rt->pixels) return;
 
-	int rt_w = rt->width;
-	int rt_h = rt->height;
+	int rt_w = p->rt->width;
+	int rt_h = p->rt->height;
 
 	/* NDC(-1~1) → 스크린 좌표 변환 */
 	float sx[3], sy[3];
 	for (int i = 0; i < 3; i++) {
-		sx[i] = vp->TopLeftX + (v[i].pos[0] + 1.0f) * 0.5f * vp->Width;
-		sy[i] = vp->TopLeftY + (1.0f - v[i].pos[1]) * 0.5f * vp->Height;
+		sx[i] = p->vp->TopLeftX + (v[i].pos[0] + 1.0f) * 0.5f * p->vp->Width;
+		sy[i] = p->vp->TopLeftY + (1.0f - v[i].pos[1]) * 0.5f * p->vp->Height;
 	}
 
 	/* 바운딩 박스 */
@@ -827,9 +1337,15 @@ static void rasterize_triangle(struct d3d_resource *rt,
 	if (max_x >= rt_w) max_x = rt_w - 1;
 	if (max_y >= rt_h) max_y = rt_h - 1;
 
-	/* 삼각형 전체 면적 (2배) */
+	/* 삼각형 전체 면적 (2배) — 부호로 앞/뒷면 판별 */
 	float area = edge_func(sx[0], sy[0], sx[1], sy[1], sx[2], sy[2]);
 	if (fabsf(area) < 0.001f) return; /* 퇴화 삼각형 */
+
+	/* 컬링: area > 0 = CW (기본 앞면), area < 0 = CCW (뒷면) */
+	if (p->cull_mode == D3D11_CULL_BACK && area < 0)
+		return;
+	if (p->cull_mode == D3D11_CULL_FRONT && area > 0)
+		return;
 
 	float inv_area = 1.0f / area;
 
@@ -856,13 +1372,65 @@ static void rasterize_triangle(struct d3d_resource *rt,
 			float b1 = w1 * inv_area;
 			float b2 = w2 * inv_area;
 
-			/* 색상 보간 */
-			float r = b0 * v[0].color[0] + b1 * v[1].color[0] + b2 * v[2].color[0];
-			float g = b0 * v[0].color[1] + b1 * v[1].color[1] + b2 * v[2].color[1];
-			float b = b0 * v[0].color[2] + b1 * v[1].color[2] + b2 * v[2].color[2];
+			/* 깊이 보간 + 테스트 */
+			if (p->depth_enable && p->depth_buf) {
+				float z = b0 * v[0].pos[2] + b1 * v[1].pos[2]
+					+ b2 * v[2].pos[2];
+				int pi = y * rt_w + x;
+				if (!depth_compare(p->depth_func, z,
+						   p->depth_buf[pi]))
+					continue;
+				if (p->depth_write)
+					p->depth_buf[pi] = z;
+			}
 
-			float rgba[4] = { r, g, b, 1.0f };
-			rt->pixels[y * rt_w + x] = float4_to_xrgb(rgba);
+			/* 색상 보간 */
+			float cr = b0 * v[0].color[0] + b1 * v[1].color[0] + b2 * v[2].color[0];
+			float cg = b0 * v[0].color[1] + b1 * v[1].color[1] + b2 * v[2].color[1];
+			float cb_c = b0 * v[0].color[2] + b1 * v[1].color[2] + b2 * v[2].color[2];
+
+			/* PS VM 실행 (있으면 고정 함수 대체) */
+			if (p->ps_dxbc && p->ps_dxbc->valid) {
+				struct shader_vm ps_vm;
+				memset(&ps_vm, 0, sizeof(ps_vm));
+				/* PS 입력: 보간된 VS 출력
+				 * v0 = 색상 (기존 PS 호환)
+				 * v1 = 색상 (VS o1→PS v1 매핑) */
+				ps_vm.inputs[0][0] = cr;
+				ps_vm.inputs[0][1] = cg;
+				ps_vm.inputs[0][2] = cb_c;
+				ps_vm.inputs[0][3] = 1.0f;
+				ps_vm.inputs[1][0] = cr;
+				ps_vm.inputs[1][1] = cg;
+				ps_vm.inputs[1][2] = cb_c;
+				ps_vm.inputs[1][3] = 1.0f;
+				for (int ci = 0; ci < 4; ci++) {
+					ps_vm.cb[ci] = p->ps_cb[ci];
+					ps_vm.cb_size[ci] = p->ps_cb_size[ci];
+				}
+				if (shader_vm_execute(&ps_vm, p->ps_dxbc) == 0) {
+					cr = ps_vm.outputs[0][0];
+					cg = ps_vm.outputs[0][1];
+					cb_c = ps_vm.outputs[0][2];
+				}
+			} else {
+				/* 텍스처 샘플링 (있으면 색상과 modulate) */
+				if (p->texture && v[0].has_texcoord) {
+					float tu = b0 * v[0].texcoord[0] + b1 * v[1].texcoord[0]
+						 + b2 * v[2].texcoord[0];
+					float tv = b0 * v[0].texcoord[1] + b1 * v[1].texcoord[1]
+						 + b2 * v[2].texcoord[1];
+					float tex_color[4];
+					sample_texture(p->texture, p->sampler,
+						       tu, tv, tex_color);
+					cr *= tex_color[0];
+					cg *= tex_color[1];
+					cb_c *= tex_color[2];
+				}
+			}
+
+			float rgba[4] = { cr, cg, cb_c, 1.0f };
+			p->rt->pixels[y * rt_w + x] = float4_to_xrgb(rgba);
 		}
 	}
 }
@@ -883,6 +1451,13 @@ static int find_semantic_offset(const struct d3d_input_layout *layout,
 }
 
 /* VB에서 float 읽기 (format에 따라) */
+static void read_float2(const uint8_t *base, int format, float out[2])
+{
+	(void)format;
+	const float *f = (const float *)base;
+	out[0] = f[0]; out[1] = f[1];
+}
+
 static void read_float3(const uint8_t *base, int format, float out[3])
 {
 	(void)format;
@@ -903,6 +1478,223 @@ static void read_float4(const uint8_t *base, int format, float out[4])
 	}
 }
 
+/* 컨텍스트에서 래스터 파라미터 구성 */
+static void build_raster_params(struct d3d11_context *c,
+				struct d3d_resource *rt,
+				struct raster_params *p)
+{
+	p->rt = rt;
+	p->vp = &c->viewport;
+
+	/* 깊이 테스트 설정 */
+	p->depth_buf = NULL;
+	p->depth_enable = 0;
+	p->depth_write = 0;
+	p->depth_func = D3D11_COMPARISON_LESS;
+
+	if (c->dsv_idx >= 0) {
+		int ds_ridx = view_table[c->dsv_idx].resource_idx;
+		if (ds_ridx >= 0) {
+			struct d3d_resource *ds = &resource_table[ds_ridx];
+			if (ds->depth)
+				p->depth_buf = ds->depth;
+		}
+	}
+
+	if (c->ds_state_idx >= 0) {
+		struct d3d_state *s = &state_table[c->ds_state_idx];
+		if (s->type == D3D_STATE_DEPTH_STENCIL) {
+			p->depth_enable = s->ds.DepthEnable;
+			p->depth_write = (s->ds.DepthWriteMask ==
+					  D3D11_DEPTH_WRITE_MASK_ALL);
+			p->depth_func = s->ds.DepthFunc;
+		}
+	}
+
+	/* 컬링 설정 */
+	p->cull_mode = D3D11_CULL_NONE; /* 기본: 컬링 없음 */
+	if (c->rs_state_idx >= 0) {
+		struct d3d_state *s = &state_table[c->rs_state_idx];
+		if (s->type == D3D_STATE_RASTERIZER)
+			p->cull_mode = s->rs.CullMode;
+	}
+
+	/* 텍스처 설정 */
+	p->texture = NULL;
+	p->sampler = NULL;
+	if (c->ps_srv_idx[0] >= 0) {
+		int srv_ridx = view_table[c->ps_srv_idx[0]].resource_idx;
+		if (srv_ridx >= 0)
+			p->texture = &resource_table[srv_ridx];
+	}
+	if (c->ps_sampler_idx[0] >= 0)
+		p->sampler = &sampler_table[c->ps_sampler_idx[0]].desc;
+
+	/* PS 셰이더 VM 설정 */
+	p->ps_dxbc = NULL;
+	memset(p->ps_cb, 0, sizeof(p->ps_cb));
+	memset(p->ps_cb_size, 0, sizeof(p->ps_cb_size));
+	if (c->ps_idx >= 0 && shader_table[c->ps_idx].dxbc.valid)
+		p->ps_dxbc = &shader_table[c->ps_idx].dxbc;
+	/* PS CB 바인딩 */
+	for (int i = 0; i < 4 && i < 8; i++) {
+		if (c->ps_cb_idx[i] >= 0) {
+			struct d3d_resource *r =
+				&resource_table[c->ps_cb_idx[i]];
+			if (r->data) {
+				p->ps_cb[i] = (const float *)r->data;
+				p->ps_cb_size[i] = (int)r->size;
+			}
+		}
+	}
+}
+
+/* ============================================================
+ * Vulkan GPU Draw 헬퍼 (Class 44)
+ * ============================================================
+ *
+ * 바인딩된 VS/PS의 SPIR-V로 파이프라인 생성(캐시),
+ * VB 데이터 업로드, CB(UBO) 업로드 후 GPU Draw 실행.
+ * 성공 시 1 반환, 실패 시 0 (SW fallback).
+ */
+#ifdef CITC_VULKAN_ENABLED
+static int vk_gpu_draw(struct d3d11_context *c,
+                       const uint8_t *vb_data, UINT vb_size,
+                       UINT vertex_stride,
+                       UINT vertex_count, UINT start_vertex,
+                       const uint8_t *ib_data, UINT ib_size,
+                       UINT index_count, int ib_r16,
+                       int rt_width, int rt_height)
+{
+	(void)start_vertex; /* TODO: VB 오프셋 지원 */
+
+	if (!use_vulkan || !g_vk_rt.active)
+		return 0;
+
+	/* VS/PS의 SPIR-V가 있어야 GPU 경로 */
+	if (c->vs_idx < 0 || c->ps_idx < 0)
+		return 0;
+	struct d3d_shader *vs = &shader_table[c->vs_idx];
+	struct d3d_shader *ps = &shader_table[c->ps_idx];
+	if (!vs->spirv || !ps->spirv)
+		return 0;
+
+	/* depth test 여부 */
+	int depth_test = 0;
+	if (c->dsv_idx >= 0 && c->ds_state_idx >= 0) {
+		struct d3d_state *s = &state_table[c->ds_state_idx];
+		if (s->type == D3D_STATE_DEPTH_STENCIL && s->ds.DepthEnable)
+			depth_test = 1;
+	}
+
+	/* CB(UBO) 여부 */
+	int has_ubo = (c->vs_cb_idx[0] >= 0);
+
+	/* 정점 속성 수 결정 */
+	int num_attrs = 1; /* 최소 pos */
+	if (c->input_layout_idx >= 0) {
+		struct d3d_input_layout *layout = &layout_table[c->input_layout_idx];
+		for (int i = 0; i < layout->num_elements; i++) {
+			if (strcmp(layout->elements[i].SemanticName, "COLOR") == 0)
+				num_attrs = num_attrs < 2 ? 2 : num_attrs;
+			else if (strcmp(layout->elements[i].SemanticName, "TEXCOORD") == 0)
+				num_attrs = num_attrs < 3 ? 3 : num_attrs;
+		}
+	}
+
+	/* 파이프라인 캐시 lookup */
+	struct vk_cached_pipeline *cp = vk_cache_find(&g_vk_pcache,
+		vs->spirv, ps->spirv, depth_test);
+
+	if (!cp) {
+		/* 새 파이프라인 생성 */
+		cp = vk_cache_insert(&g_vk_pcache);
+		if (!cp) return 0; /* 캐시 꽉 참 */
+
+		if (vk_create_user_pipeline(&g_vk, &g_vk_rt,
+				vs->spirv, vs->spirv_size,
+				ps->spirv, ps->spirv_size,
+				vertex_stride, num_attrs,
+				has_ubo, depth_test,
+				&cp->pipeline, &cp->layout,
+				&cp->ds_layout, &cp->ds_pool) != 0) {
+			g_vk_pcache.count--;
+			return 0; /* 파이프라인 생성 실패 → SW fallback */
+		}
+		cp->vs_spirv = vs->spirv;
+		cp->ps_spirv = ps->spirv;
+		cp->depth_test = depth_test;
+	}
+
+	/* VB 업로드 */
+	VkDeviceSize needed_vb = (VkDeviceSize)vb_size;
+	if (!g_vk_vb.buffer || g_vk_vb.size < needed_vb) {
+		if (g_vk_vb.buffer) vk_destroy_buffer(&g_vk, &g_vk_vb);
+		VkBufferUsageFlags usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+		if (vk_create_buffer(&g_vk, &g_vk_vb, needed_vb, usage,
+				VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+				VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0)
+			return 0;
+	}
+	vk_upload_buffer(&g_vk, &g_vk_vb, vb_data, needed_vb);
+
+	/* IB 업로드 (indexed draw) */
+	if (ib_data && ib_size > 0) {
+		VkDeviceSize needed_ib = (VkDeviceSize)ib_size;
+		if (!g_vk_ib.buffer || g_vk_ib.size < needed_ib) {
+			if (g_vk_ib.buffer) vk_destroy_buffer(&g_vk, &g_vk_ib);
+			VkBufferUsageFlags usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+			if (vk_create_buffer(&g_vk, &g_vk_ib, needed_ib, usage,
+					VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+					VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0)
+				return 0;
+		}
+		vk_upload_buffer(&g_vk, &g_vk_ib, ib_data, needed_ib);
+	}
+
+	/* UBO 업로드 */
+	VkDescriptorSet ds = VK_NULL_HANDLE;
+	if (has_ubo && cp->ds_layout) {
+		struct d3d_resource *cb_res = &resource_table[c->vs_cb_idx[0]];
+		if (cb_res->data && cb_res->size > 0) {
+			VkDeviceSize needed_ubo = (VkDeviceSize)cb_res->size;
+			if (!g_vk_ubo.buffer || g_vk_ubo.size < needed_ubo) {
+				if (g_vk_ubo.buffer)
+					vk_destroy_buffer(&g_vk, &g_vk_ubo);
+				if (vk_create_buffer(&g_vk, &g_vk_ubo, needed_ubo,
+						VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+						VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+						VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0)
+					return 0;
+			}
+			vk_upload_buffer(&g_vk, &g_vk_ubo,
+					 cb_res->data, needed_ubo);
+
+			if (vk_alloc_descriptor_set(&g_vk, cp->ds_layout,
+						    cp->ds_pool, &ds) == 0)
+				vk_update_ubo_descriptor(&g_vk, ds, &g_vk_ubo);
+		}
+	}
+
+	/* GPU Draw */
+	int ok;
+	if (ib_data && index_count > 0) {
+		VkIndexType idx_type = ib_r16 ? VK_INDEX_TYPE_UINT16
+		                              : VK_INDEX_TYPE_UINT32;
+		ok = vk_draw_indexed(&g_vk, &g_vk_rt, cp->pipeline, cp->layout,
+		                     &g_vk_vb, &g_vk_ib,
+		                     index_count, idx_type, ds,
+		                     rt_width, rt_height) == 0;
+	} else {
+		ok = vk_draw_full(&g_vk, &g_vk_rt, cp->pipeline, cp->layout,
+		                  &g_vk_vb, vertex_count, ds,
+		                  rt_width, rt_height) == 0;
+	}
+
+	return ok ? 1 : 0;
+}
+#endif /* CITC_VULKAN_ENABLED */
+
 /*
  * Draw — 소프트웨어 렌더링 파이프라인 실행
  *
@@ -920,6 +1712,10 @@ ctx_Draw(void *This, UINT VertexCount, UINT StartVertexLocation)
 	if (ridx < 0) return;
 	struct d3d_resource *rt = &resource_table[ridx];
 
+	/* 래스터 파라미터 구성 */
+	struct raster_params rp;
+	build_raster_params(c, rt, &rp);
+
 	/* VB 데이터 */
 	if (c->vb_resource_idx < 0) return;
 	struct d3d_resource *vb = &resource_table[c->vb_resource_idx];
@@ -929,21 +1725,35 @@ ctx_Draw(void *This, UINT VertexCount, UINT StartVertexLocation)
 	if (c->input_layout_idx < 0) return;
 	struct d3d_input_layout *layout = &layout_table[c->input_layout_idx];
 
-	/* POSITION, COLOR 오프셋 찾기 */
-	int pos_fmt = 0, col_fmt = 0;
+	/* POSITION, COLOR, TEXCOORD 오프셋 찾기 */
+	int pos_fmt = 0, col_fmt = 0, tc_fmt = 0;
 	int pos_off = find_semantic_offset(layout, "POSITION", &pos_fmt);
 	int col_off = find_semantic_offset(layout, "COLOR", &col_fmt);
+	int tc_off = find_semantic_offset(layout, "TEXCOORD", &tc_fmt);
 
-	if (pos_off < 0) {
-		/* SV_Position 시도 */
+	if (pos_off < 0)
 		pos_off = find_semantic_offset(layout, "SV_Position", &pos_fmt);
-	}
-	if (pos_off < 0) return; /* position 없으면 그릴 수 없음 */
+	if (pos_off < 0) return;
 
 	UINT stride = c->vb_stride;
 	if (stride == 0) return;
 
 	const uint8_t *vb_data = (const uint8_t *)vb->data;
+
+#ifdef CITC_VULKAN_ENABLED
+	/* GPU 경로 (SW와 병렬 실행 — Present에서 readback) */
+	vk_gpu_draw(c, (const uint8_t *)vb->data, (UINT)vb->size,
+		    stride, VertexCount, StartVertexLocation,
+		    NULL, 0, 0, 0, rt->width, rt->height);
+#endif
+
+	/* VS DXBC VM 사용 여부 확인 */
+	int use_vs_vm = 0;
+	struct dxbc_info *vs_dxbc = NULL;
+	if (c->vs_idx >= 0 && shader_table[c->vs_idx].dxbc.valid) {
+		vs_dxbc = &shader_table[c->vs_idx].dxbc;
+		use_vs_vm = 1;
+	}
 
 	/* 삼각형 리스트 래스터라이징 */
 	if (c->topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
@@ -953,20 +1763,123 @@ ctx_Draw(void *This, UINT VertexCount, UINT StartVertexLocation)
 			for (int j = 0; j < 3; j++) {
 				const uint8_t *v = vb_data + (i + j) * stride;
 
-				read_float3(v + pos_off, pos_fmt, tri[j].pos);
-				tri[j].pos[3] = 1.0f;
+				if (use_vs_vm) {
+					/* === VS VM 경로 === */
+					struct shader_vm vm;
+					memset(&vm, 0, sizeof(vm));
 
-				if (col_off >= 0)
-					read_float4(v + col_off, col_fmt, tri[j].color);
-				else {
-					tri[j].color[0] = 1.0f;
-					tri[j].color[1] = 1.0f;
-					tri[j].color[2] = 1.0f;
-					tri[j].color[3] = 1.0f;
+					/* 입력 레지스터 설정 (v0=POS, v1=COL, v2=TC) */
+					read_float3(v + pos_off, pos_fmt,
+						    vm.inputs[0]);
+					vm.inputs[0][3] = 1.0f;
+
+					if (col_off >= 0)
+						read_float4(v + col_off,
+							    col_fmt,
+							    vm.inputs[1]);
+					else {
+						vm.inputs[1][0] = 1.0f;
+						vm.inputs[1][1] = 1.0f;
+						vm.inputs[1][2] = 1.0f;
+						vm.inputs[1][3] = 1.0f;
+					}
+
+					if (tc_off >= 0) {
+						read_float2(v + tc_off,
+							    tc_fmt,
+							    vm.inputs[2]);
+					}
+
+					/* VS CB 바인딩 */
+					for (int ci = 0; ci < 4; ci++) {
+						if (c->vs_cb_idx[ci] >= 0) {
+							struct d3d_resource *cb2 =
+								&resource_table[c->vs_cb_idx[ci]];
+							if (cb2->data) {
+								vm.cb[ci] = (const float *)cb2->data;
+								vm.cb_size[ci] = (int)cb2->size;
+							}
+						}
+					}
+
+					/* VM 실행 */
+					shader_vm_execute(&vm, vs_dxbc);
+
+					/* o0 = SV_Position (perspective divide) */
+					float *clip = vm.outputs[0];
+					if (fabsf(clip[3]) > 1e-6f) {
+						tri[j].pos[0] = clip[0] / clip[3];
+						tri[j].pos[1] = clip[1] / clip[3];
+						tri[j].pos[2] = clip[2] / clip[3];
+						tri[j].pos[3] = clip[3];
+					} else {
+						memcpy(tri[j].pos, clip, 16);
+					}
+
+					/* o1 = COLOR */
+					memcpy(tri[j].color, vm.outputs[1], 16);
+
+					/* TEXCOORD */
+					if (tc_off >= 0) {
+						tri[j].texcoord[0] = vm.outputs[2][0];
+						tri[j].texcoord[1] = vm.outputs[2][1];
+						tri[j].has_texcoord = 1;
+					} else {
+						tri[j].texcoord[0] = 0;
+						tri[j].texcoord[1] = 0;
+						tri[j].has_texcoord = 0;
+					}
+				} else {
+					/* === 고정 함수 경로 === */
+					float raw_pos[4];
+					read_float3(v + pos_off, pos_fmt,
+						    raw_pos);
+					raw_pos[3] = 1.0f;
+
+					/* MVP 변환 */
+					if (c->vs_cb_idx[0] >= 0) {
+						struct d3d_resource *cb =
+							&resource_table[c->vs_cb_idx[0]];
+						if (cb->data && cb->size >= 64) {
+							float transformed[4];
+							mat4_mul_vec4(
+								(const float *)cb->data,
+								raw_pos, transformed);
+							if (fabsf(transformed[3]) > 1e-6f) {
+								tri[j].pos[0] = transformed[0] / transformed[3];
+								tri[j].pos[1] = transformed[1] / transformed[3];
+								tri[j].pos[2] = transformed[2] / transformed[3];
+								tri[j].pos[3] = transformed[3];
+							} else {
+								memcpy(tri[j].pos, transformed, 16);
+							}
+						} else {
+							memcpy(tri[j].pos, raw_pos, 16);
+						}
+					} else {
+						memcpy(tri[j].pos, raw_pos, 16);
+					}
+
+					if (col_off >= 0)
+						read_float4(v + col_off, col_fmt, tri[j].color);
+					else {
+						tri[j].color[0] = 1.0f;
+						tri[j].color[1] = 1.0f;
+						tri[j].color[2] = 1.0f;
+						tri[j].color[3] = 1.0f;
+					}
+
+					if (tc_off >= 0) {
+						read_float2(v + tc_off, tc_fmt, tri[j].texcoord);
+						tri[j].has_texcoord = 1;
+					} else {
+						tri[j].texcoord[0] = tri[j].texcoord[1] = 0.0f;
+						tri[j].has_texcoord = 0;
+					}
 				}
 			}
 
-			rasterize_triangle(rt, &c->viewport, tri);
+			rasterize_triangle(&rp, tri);
 		}
 	}
 }
@@ -983,6 +1896,9 @@ ctx_DrawIndexed(void *This, UINT IndexCount,
 	if (ridx < 0) return;
 	struct d3d_resource *rt = &resource_table[ridx];
 
+	struct raster_params rp;
+	build_raster_params(c, rt, &rp);
+
 	if (c->vb_resource_idx < 0 || c->ib_resource_idx < 0) return;
 	struct d3d_resource *vb = &resource_table[c->vb_resource_idx];
 	struct d3d_resource *ib = &resource_table[c->ib_resource_idx];
@@ -991,9 +1907,10 @@ ctx_DrawIndexed(void *This, UINT IndexCount,
 	if (c->input_layout_idx < 0) return;
 	struct d3d_input_layout *layout = &layout_table[c->input_layout_idx];
 
-	int pos_fmt = 0, col_fmt = 0;
+	int pos_fmt = 0, col_fmt = 0, tc_fmt = 0;
 	int pos_off = find_semantic_offset(layout, "POSITION", &pos_fmt);
 	int col_off = find_semantic_offset(layout, "COLOR", &col_fmt);
+	int tc_off = find_semantic_offset(layout, "TEXCOORD", &tc_fmt);
 	if (pos_off < 0)
 		pos_off = find_semantic_offset(layout, "SV_Position", &pos_fmt);
 	if (pos_off < 0) return;
@@ -1003,6 +1920,26 @@ ctx_DrawIndexed(void *This, UINT IndexCount,
 
 	const uint8_t *vb_data = (const uint8_t *)vb->data;
 	const uint8_t *ib_data = (const uint8_t *)ib->data;
+
+#ifdef CITC_VULKAN_ENABLED
+	/* GPU 경로 */
+	{
+		int ib_r16 = (c->ib_format == DXGI_FORMAT_R16_UINT);
+		vk_gpu_draw(c, (const uint8_t *)vb->data, (UINT)vb->size,
+			    stride, 0, 0,
+			    (const uint8_t *)ib->data, (UINT)ib->size,
+			    IndexCount, ib_r16,
+			    rt->width, rt->height);
+	}
+#endif
+
+	/* VS DXBC VM 사용 여부 확인 */
+	int use_vs_vm = 0;
+	struct dxbc_info *vs_dxbc = NULL;
+	if (c->vs_idx >= 0 && shader_table[c->vs_idx].dxbc.valid) {
+		vs_dxbc = &shader_table[c->vs_idx].dxbc;
+		use_vs_vm = 1;
+	}
 
 	if (c->topology == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST) {
 		for (UINT i = StartIndexLocation; i + 2 < StartIndexLocation + IndexCount; i += 3) {
@@ -1018,28 +1955,134 @@ ctx_DrawIndexed(void *This, UINT IndexCount,
 				idx = (UINT)((int)idx + BaseVertexLocation);
 
 				const uint8_t *v = vb_data + idx * stride;
-				read_float3(v + pos_off, pos_fmt, tri[j].pos);
-				tri[j].pos[3] = 1.0f;
 
-				if (col_off >= 0)
-					read_float4(v + col_off, col_fmt, tri[j].color);
-				else {
-					tri[j].color[0] = 1.0f;
-					tri[j].color[1] = 1.0f;
-					tri[j].color[2] = 1.0f;
-					tri[j].color[3] = 1.0f;
+				if (use_vs_vm) {
+					/* === VS VM 경로 === */
+					struct shader_vm vm;
+					memset(&vm, 0, sizeof(vm));
+
+					read_float3(v + pos_off, pos_fmt,
+						    vm.inputs[0]);
+					vm.inputs[0][3] = 1.0f;
+
+					if (col_off >= 0)
+						read_float4(v + col_off,
+							    col_fmt,
+							    vm.inputs[1]);
+					else {
+						vm.inputs[1][0] = 1.0f;
+						vm.inputs[1][1] = 1.0f;
+						vm.inputs[1][2] = 1.0f;
+						vm.inputs[1][3] = 1.0f;
+					}
+
+					if (tc_off >= 0) {
+						read_float2(v + tc_off,
+							    tc_fmt,
+							    vm.inputs[2]);
+					}
+
+					for (int ci = 0; ci < 4; ci++) {
+						if (c->vs_cb_idx[ci] >= 0) {
+							struct d3d_resource *cb2 =
+								&resource_table[c->vs_cb_idx[ci]];
+							if (cb2->data) {
+								vm.cb[ci] = (const float *)cb2->data;
+								vm.cb_size[ci] = (int)cb2->size;
+							}
+						}
+					}
+
+					shader_vm_execute(&vm, vs_dxbc);
+
+					float *clip = vm.outputs[0];
+					if (fabsf(clip[3]) > 1e-6f) {
+						tri[j].pos[0] = clip[0] / clip[3];
+						tri[j].pos[1] = clip[1] / clip[3];
+						tri[j].pos[2] = clip[2] / clip[3];
+						tri[j].pos[3] = clip[3];
+					} else {
+						memcpy(tri[j].pos, clip, 16);
+					}
+
+					memcpy(tri[j].color, vm.outputs[1], 16);
+
+					if (tc_off >= 0) {
+						tri[j].texcoord[0] = vm.outputs[2][0];
+						tri[j].texcoord[1] = vm.outputs[2][1];
+						tri[j].has_texcoord = 1;
+					} else {
+						tri[j].texcoord[0] = 0;
+						tri[j].texcoord[1] = 0;
+						tri[j].has_texcoord = 0;
+					}
+				} else {
+					/* === 고정 함수 경로 === */
+					float raw_pos[4];
+					read_float3(v + pos_off, pos_fmt, raw_pos);
+					raw_pos[3] = 1.0f;
+
+					if (c->vs_cb_idx[0] >= 0) {
+						struct d3d_resource *cb =
+							&resource_table[c->vs_cb_idx[0]];
+						if (cb->data && cb->size >= 64) {
+							float transformed[4];
+							mat4_mul_vec4(
+								(const float *)cb->data,
+								raw_pos, transformed);
+							if (fabsf(transformed[3]) > 1e-6f) {
+								tri[j].pos[0] = transformed[0] / transformed[3];
+								tri[j].pos[1] = transformed[1] / transformed[3];
+								tri[j].pos[2] = transformed[2] / transformed[3];
+								tri[j].pos[3] = transformed[3];
+							} else {
+								memcpy(tri[j].pos, transformed, 16);
+							}
+						} else {
+							memcpy(tri[j].pos, raw_pos, 16);
+						}
+					} else {
+						memcpy(tri[j].pos, raw_pos, 16);
+					}
+
+					if (col_off >= 0)
+						read_float4(v + col_off, col_fmt, tri[j].color);
+					else {
+						tri[j].color[0] = 1.0f;
+						tri[j].color[1] = 1.0f;
+						tri[j].color[2] = 1.0f;
+						tri[j].color[3] = 1.0f;
+					}
+
+					if (tc_off >= 0) {
+						read_float2(v + tc_off, tc_fmt, tri[j].texcoord);
+						tri[j].has_texcoord = 1;
+					} else {
+						tri[j].texcoord[0] = tri[j].texcoord[1] = 0.0f;
+						tri[j].has_texcoord = 0;
+					}
 				}
 			}
 
-			rasterize_triangle(rt, &c->viewport, tri);
+			rasterize_triangle(&rp, tri);
 		}
 	}
 }
 
 /* PSSetConstantBuffers */
 static void __attribute__((ms_abi))
-ctx_PSSetConstantBuffers(void *T, UINT s, UINT n, void *const *pp)
-{ (void)T; (void)s; (void)n; (void)pp; }
+ctx_PSSetConstantBuffers(void *This, UINT StartSlot, UINT NumBuffers,
+			 void *const *ppConstantBuffers)
+{
+	struct d3d11_context *c = This;
+	for (UINT i = 0; i < NumBuffers && (StartSlot + i) < 8; i++) {
+		if (ppConstantBuffers && ppConstantBuffers[i])
+			c->ps_cb_idx[StartSlot + i] =
+				handle_to_resource_idx(ppConstantBuffers[i]);
+		else
+			c->ps_cb_idx[StartSlot + i] = -1;
+	}
+}
 
 /* 나머지 Context 스텁 */
 static void __attribute__((ms_abi)) ctx_stub(void *T, ...)
@@ -1060,6 +2103,16 @@ ctx_ClearState(void *This)
 	c->dsv_idx = -1;
 	c->topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
 	memset(&c->viewport, 0, sizeof(c->viewport));
+	for (int i = 0; i < 8; i++) {
+		c->vs_cb_idx[i] = -1;
+		c->ps_cb_idx[i] = -1;
+		c->ps_srv_idx[i] = -1;
+		c->ps_sampler_idx[i] = -1;
+	}
+	c->ds_state_idx = -1;
+	c->blend_state_idx = -1;
+	c->rs_state_idx = -1;
+	c->stencil_ref = 0;
 }
 
 static ID3D11DeviceContextVtbl g_context_vtbl = {
@@ -1103,27 +2156,27 @@ static ID3D11DeviceContextVtbl g_context_vtbl = {
 	/* OM */
 	.OMSetRenderTargets       = ctx_OMSetRenderTargets,
 	.OMSetRenderTargetsAndUnorderedAccessViews = (void *)ctx_stub,
-	.OMSetBlendState          = (void *)ctx_stub,
-	.OMSetDepthStencilState   = (void *)ctx_stub,
+	.OMSetBlendState          = ctx_OMSetBlendState,
+	.OMSetDepthStencilState   = ctx_OMSetDepthStencilState,
 	.SOSetTargets             = (void *)ctx_stub,
 	.DrawAuto                 = (void *)ctx_stub,
 	.DrawIndexedInstancedIndirect = (void *)ctx_stub,
 	.DrawInstancedIndirect    = (void *)ctx_stub,
 	.Dispatch                 = (void *)ctx_stub,
 	.DispatchIndirect         = (void *)ctx_stub,
-	.RSSetState               = (void *)ctx_stub,
+	.RSSetState               = ctx_RSSetState,
 	.RSSetViewports           = ctx_RSSetViewports,
 	.RSSetScissorRects        = (void *)ctx_stub,
 	/* Copy/Update */
 	.CopySubresourceRegion    = (void *)ctx_stub,
 	.CopyResource             = (void *)ctx_stub,
-	.UpdateSubresource        = (void *)ctx_stub,
+	.UpdateSubresource        = ctx_UpdateSubresource,
 	.CopyStructureCount       = (void *)ctx_stub,
 	/* Clear */
 	.ClearRenderTargetView    = ctx_ClearRenderTargetView,
 	.ClearUnorderedAccessViewUint  = (void *)ctx_stub,
 	.ClearUnorderedAccessViewFloat = (void *)ctx_stub,
-	.ClearDepthStencilView    = (void *)ctx_stub,
+	.ClearDepthStencilView    = ctx_ClearDepthStencilView,
 	.GenerateMips             = (void *)ctx_stub,
 	.SetResourceMinLOD        = (void *)ctx_stub,
 	.GetResourceMinLOD        = (void *)ctx_stub,
@@ -1271,6 +2324,15 @@ d3d11_CreateDevice(void *pAdapter, D3D_DRIVER_TYPE DriverType,
 		g_context->ps_idx = -1;
 		g_context->rtv_idx = -1;
 		g_context->dsv_idx = -1;
+		g_context->ds_state_idx = -1;
+		g_context->blend_state_idx = -1;
+		g_context->rs_state_idx = -1;
+		for (int i = 0; i < 8; i++) {
+			g_context->vs_cb_idx[i] = -1;
+			g_context->ps_cb_idx[i] = -1;
+			g_context->ps_srv_idx[i] = -1;
+			g_context->ps_sampler_idx[i] = -1;
+		}
 	}
 
 	if (ppDevice) *ppDevice = dev;
@@ -1280,8 +2342,27 @@ d3d11_CreateDevice(void *pAdapter, D3D_DRIVER_TYPE DriverType,
 		g_context->ref_count++;
 	}
 
+#ifdef CITC_VULKAN_ENABLED
+	/* Vulkan GPU 백엔드 초기화 시도 */
+	if (!use_vulkan) {
+		if (vk_load_vulkan(&g_vk) == 0 && vk_backend_init(&g_vk) == 0) {
+			use_vulkan = 1;
+			printf("d3d11: Vulkan GPU backend: %s\n",
+			       g_vk.device_name);
+		} else {
+			printf("d3d11: Vulkan not available, SW fallback\n");
+		}
+	}
+#endif
+
+#ifdef CITC_VULKAN_ENABLED
+	printf("d3d11: Device created (FL %x, %s)\n",
+	       dev->feature_level,
+	       use_vulkan ? "Vulkan GPU" : "software rasterizer");
+#else
 	printf("d3d11: Device created (FL %x, software rasterizer)\n",
 	       dev->feature_level);
+#endif
 	return S_OK;
 }
 
@@ -1321,6 +2402,38 @@ d3d11_CreateDeviceAndSwapChain(void *pAdapter, D3D_DRIVER_TYPE DriverType,
 	}
 
 	return S_OK;
+}
+
+/* ============================================================
+ * Vulkan 렌더 타깃 / Readback (d3d11.h 공개 API)
+ * ============================================================ */
+
+void d3d11_vk_create_rt(int width, int height)
+{
+#ifdef CITC_VULKAN_ENABLED
+	if (!use_vulkan) return;
+	if (g_vk_rt.active)
+		vk_destroy_render_target(&g_vk, &g_vk_rt);
+	if (vk_create_render_target(&g_vk, &g_vk_rt,
+				    (uint32_t)width, (uint32_t)height) == 0)
+		printf("d3d11: Vulkan render target %dx%d created\n",
+		       width, height);
+#else
+	(void)width; (void)height;
+#endif
+}
+
+int d3d11_vk_readback(uint32_t *pixels, int width, int height)
+{
+#ifdef CITC_VULKAN_ENABLED
+	if (!use_vulkan || !g_vk_rt.active) return 0;
+	if ((int)g_vk_rt.width != width || (int)g_vk_rt.height != height)
+		return 0;
+	return vk_readback_pixels(&g_vk, &g_vk_rt, pixels) == 0 ? 1 : 0;
+#else
+	(void)pixels; (void)width; (void)height;
+	return 0;
+#endif
 }
 
 /* ============================================================

@@ -115,6 +115,71 @@ typedef enum {
 	D3D11_SRV_DIMENSION_TEXTURE2D = 4,
 } D3D11_SRV_DIMENSION;
 
+/* 비교 함수 (깊이 테스트, 스텐실 테스트) */
+typedef enum {
+	D3D11_COMPARISON_NEVER         = 1,
+	D3D11_COMPARISON_LESS          = 2,
+	D3D11_COMPARISON_EQUAL         = 3,
+	D3D11_COMPARISON_LESS_EQUAL    = 4,
+	D3D11_COMPARISON_GREATER       = 5,
+	D3D11_COMPARISON_NOT_EQUAL     = 6,
+	D3D11_COMPARISON_GREATER_EQUAL = 7,
+	D3D11_COMPARISON_ALWAYS        = 8,
+} D3D11_COMPARISON_FUNC;
+
+/* 깊이 쓰기 마스크 */
+typedef enum {
+	D3D11_DEPTH_WRITE_MASK_ZERO = 0,
+	D3D11_DEPTH_WRITE_MASK_ALL  = 1,
+} D3D11_DEPTH_WRITE_MASK;
+
+/* 채우기 모드 */
+typedef enum {
+	D3D11_FILL_WIREFRAME = 2,
+	D3D11_FILL_SOLID     = 3,
+} D3D11_FILL_MODE;
+
+/* 컬링 모드 */
+typedef enum {
+	D3D11_CULL_NONE  = 1,
+	D3D11_CULL_FRONT = 2,
+	D3D11_CULL_BACK  = 3,
+} D3D11_CULL_MODE;
+
+/* 블렌드 팩터 */
+typedef enum {
+	D3D11_BLEND_ZERO             = 1,
+	D3D11_BLEND_ONE              = 2,
+	D3D11_BLEND_SRC_ALPHA        = 5,
+	D3D11_BLEND_INV_SRC_ALPHA    = 6,
+} D3D11_BLEND;
+
+/* 블렌드 연산 */
+typedef enum {
+	D3D11_BLEND_OP_ADD          = 1,
+	D3D11_BLEND_OP_SUBTRACT     = 2,
+	D3D11_BLEND_OP_REV_SUBTRACT = 3,
+	D3D11_BLEND_OP_MIN          = 4,
+	D3D11_BLEND_OP_MAX          = 5,
+} D3D11_BLEND_OP;
+
+/* 깊이 버퍼 클리어 플래그 */
+#define D3D11_CLEAR_DEPTH   0x1
+#define D3D11_CLEAR_STENCIL 0x2
+
+/* 텍스처 필터링 */
+typedef enum {
+	D3D11_FILTER_MIN_MAG_MIP_POINT  = 0,
+	D3D11_FILTER_MIN_MAG_MIP_LINEAR = 0x15,
+} D3D11_FILTER;
+
+/* 텍스처 주소 모드 */
+typedef enum {
+	D3D11_TEXTURE_ADDRESS_WRAP   = 1,
+	D3D11_TEXTURE_ADDRESS_MIRROR = 2,
+	D3D11_TEXTURE_ADDRESS_CLAMP  = 3,
+} D3D11_TEXTURE_ADDRESS_MODE;
+
 /* D3D11 Create Device 플래그 */
 #define D3D11_CREATE_DEVICE_SINGLETHREADED  0x1
 #define D3D11_CREATE_DEVICE_DEBUG           0x2
@@ -246,6 +311,82 @@ typedef struct {
 	UINT  RowPitch;
 	UINT  DepthPitch;
 } D3D11_MAPPED_SUBRESOURCE;
+
+/* 깊이/스텐실 연산 설명 (스텐실 면별) */
+typedef struct {
+	UINT                    StencilFailOp;
+	UINT                    StencilDepthFailOp;
+	UINT                    StencilPassOp;
+	D3D11_COMPARISON_FUNC   StencilFunc;
+} D3D11_DEPTH_STENCILOP_DESC;
+
+/* 깊이/스텐실 상태 설명 */
+typedef struct {
+	BOOL                        DepthEnable;
+	D3D11_DEPTH_WRITE_MASK      DepthWriteMask;
+	D3D11_COMPARISON_FUNC       DepthFunc;
+	BOOL                        StencilEnable;
+	uint8_t                     StencilReadMask;
+	uint8_t                     StencilWriteMask;
+	D3D11_DEPTH_STENCILOP_DESC  FrontFace;
+	D3D11_DEPTH_STENCILOP_DESC  BackFace;
+} D3D11_DEPTH_STENCIL_DESC;
+
+/* 블렌드 상태 설명 (렌더 타깃당) */
+typedef struct {
+	BOOL           BlendEnable;
+	D3D11_BLEND    SrcBlend;
+	D3D11_BLEND    DestBlend;
+	D3D11_BLEND_OP BlendOp;
+	D3D11_BLEND    SrcBlendAlpha;
+	D3D11_BLEND    DestBlendAlpha;
+	D3D11_BLEND_OP BlendOpAlpha;
+	uint8_t        RenderTargetWriteMask;
+} D3D11_RENDER_TARGET_BLEND_DESC;
+
+typedef struct {
+	BOOL                             AlphaToCoverageEnable;
+	BOOL                             IndependentBlendEnable;
+	D3D11_RENDER_TARGET_BLEND_DESC   RenderTarget[8];
+} D3D11_BLEND_DESC;
+
+/* 래스터라이저 상태 설명 */
+typedef struct {
+	D3D11_FILL_MODE FillMode;
+	D3D11_CULL_MODE CullMode;
+	BOOL            FrontCounterClockwise;
+	int             DepthBias;
+	float           DepthBiasClamp;
+	float           SlopeScaledDepthBias;
+	BOOL            DepthClipEnable;
+	BOOL            ScissorEnable;
+	BOOL            MultisampleEnable;
+	BOOL            AntialiasedLineEnable;
+} D3D11_RASTERIZER_DESC;
+
+/* 깊이/스텐실 뷰 설명 */
+typedef struct {
+	DXGI_FORMAT Format;
+	UINT        ViewDimension;
+	UINT        Flags;
+	union {
+		struct { UINT MipSlice; } Texture2D;
+	};
+} D3D11_DEPTH_STENCIL_VIEW_DESC;
+
+/* 샘플러 상태 설명 */
+typedef struct {
+	D3D11_FILTER               Filter;
+	D3D11_TEXTURE_ADDRESS_MODE AddressU;
+	D3D11_TEXTURE_ADDRESS_MODE AddressV;
+	D3D11_TEXTURE_ADDRESS_MODE AddressW;
+	float                      MipLODBias;
+	UINT                       MaxAnisotropy;
+	D3D11_COMPARISON_FUNC      ComparisonFunc;
+	float                      BorderColor[4];
+	float                      MinLOD;
+	float                      MaxLOD;
+} D3D11_SAMPLER_DESC;
 
 /* ============================================================
  * COM 인터페이스 전방 선언

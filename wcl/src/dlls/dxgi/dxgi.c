@@ -29,6 +29,7 @@
 #include "../../../include/d3d11_types.h"
 #include "../../../include/stub_entry.h"
 #include "../user32/user32.h"
+#include "../d3d11/d3d11.h"
 
 /* ============================================================
  * IDXGIAdapter 구현
@@ -506,6 +507,13 @@ void dxgi_set_swapchain_resource(void *pSwapChain, int resource_idx)
 	if (sc) sc->resource_idx = resource_idx;
 }
 
+int dxgi_get_swapchain_resource_idx(void *pSwapChain)
+{
+	struct dxgi_swap_chain *sc = pSwapChain;
+	if (!sc || !sc->backbuffer) return -1;
+	return sc->resource_idx;
+}
+
 /*
  * 내부 API — D3D11CreateDeviceAndSwapChain에서 호출
  *
@@ -530,6 +538,11 @@ HRESULT dxgi_create_swapchain_for_d3d11(void *pDevice,
 
 	/* Factory 해제 */
 	free(f);
+
+	/* Vulkan 렌더 타깃 생성 (가능하면) */
+	if (hr == S_OK)
+		d3d11_vk_create_rt((int)pDesc->BufferDesc.Width,
+				   (int)pDesc->BufferDesc.Height);
 
 	return hr;
 }

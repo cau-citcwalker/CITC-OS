@@ -37,4 +37,16 @@ int d3d11_register_swapchain_texture(void *pSwapChain,
 				     uint32_t *pixels,
 				     int width, int height);
 
+/*
+ * Vulkan 렌더 타깃 생성 (SwapChain 생성 시 호출)
+ * Vulkan 비활성이면 아무것도 하지 않음.
+ */
+void d3d11_vk_create_rt(int width, int height);
+
+/*
+ * Vulkan readback. GPU 픽셀을 CPU 버퍼에 복사.
+ * 반환: 1이면 readback 수행함, 0이면 SW 모드 (readback 불필요)
+ */
+int d3d11_vk_readback(uint32_t *pixels, int width, int height);
+
 #endif /* CITC_D3D11_H */
