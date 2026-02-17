@@ -62,6 +62,13 @@
  */
 #include "../../fbdraw/src/font8x8.h"
 
+/* PSF2 폰트 (Class 61) */
+#include "../../font/psf2.h"
+
+static struct psf2_font g_shell_psf2;
+static int g_shell_font_w = 8;
+static int g_shell_font_h = 8;
+
 /* ============================================================
  * 상수
  * ============================================================ */
@@ -117,6 +124,24 @@ static int num_buttons;
  *   → 정적 배열에 저장하여 프로그램 종료까지 유지.
  */
 static struct desktop_entry desktop_apps[MAX_DESKTOP_ENTRIES];
+
+/*
+ * 윈도우 목록 버튼 (Class 63)
+ * 태스크바에 열린 윈도우를 표시.
+ * 클릭하면 해당 윈도우에 포커스.
+ */
+#define MAX_WIN_BTNS  CDP_MAX_WINLIST
+struct win_button {
+	int x, y, w, h;
+	uint32_t surface_id;
+	char title[32];
+	int minimized;
+	int hovered;
+};
+
+static struct win_button win_btns[MAX_WIN_BTNS];
+static int num_win_btns;
+static int launcher_end_x;   /* 런처 버튼 끝 x 좌표 */
 
 /* ============================================================
  * 전역 상태
@@ -181,10 +206,16 @@ static void draw_rect(uint32_t *pixels, int width, int height,
 	}
 }
 
-/* 한 글자 그리기 (8×8 비트맵 폰트) */
+/* 한 글자 그리기 (PSF2 우선, font8x8 폴백) */
 static void draw_char(uint32_t *pixels, int width, int height,
 		      int cx, int cy, char c, uint32_t color)
 {
+	if (g_shell_psf2.loaded) {
+		psf2_draw_char(pixels, width, cx, cy, c, color,
+			       &g_shell_psf2);
+		return;
+	}
+
 	unsigned char ch = (unsigned char)c;
 
 	if (ch > 127)
@@ -212,7 +243,7 @@ static void draw_string(uint32_t *pixels, int width, int height,
 {
 	while (*str) {
 		draw_char(pixels, width, height, sx, sy, *str, color);
-		sx += 8;
+		sx += g_shell_font_w;
 		str++;
 	}
 }
@@ -231,7 +262,7 @@ static void add_button(int x, const char *label, const char *command)
 
 	btn->x = x;
 	btn->y = (PANEL_HEIGHT - BTN_HEIGHT) / 2;
-	btn->w = label_len * 8 + BTN_PADDING * 2;
+	btn->w = label_len * g_shell_font_w + BTN_PADDING * 2;
 	btn->h = BTN_HEIGHT;
 	btn->label = label;
 	btn->command = command;
@@ -278,7 +309,47 @@ static int setup_buttons(void)
 		x += buttons[num_buttons - 1].w + BTN_MARGIN;
 	}
 
+	launcher_end_x = x;
 	return x; /* 다음 사용 가능한 x 좌표 */
+}
+
+/* ============================================================
+ * 윈도우 목록 갱신 (Class 63)
+ * ============================================================ */
+
+static void update_window_list(void)
+{
+	struct cdp_window_list wl;
+
+	if (cdp_list_windows(conn, &wl) < 0)
+		return;
+
+	num_win_btns = 0;
+	int x = launcher_end_x + 8; /* 구분선 뒤 */
+
+	for (uint32_t i = 0; i < wl.count && (int)i < MAX_WIN_BTNS; i++) {
+		struct win_button *wb = &win_btns[num_win_btns];
+		int title_len = (int)strlen(wl.entries[i].title);
+
+		if (title_len > 12)
+			title_len = 12; /* 최대 12자 표시 */
+
+		wb->x = x;
+		wb->y = (PANEL_HEIGHT - BTN_HEIGHT) / 2;
+		wb->w = title_len * g_shell_font_w + BTN_PADDING;
+		wb->h = BTN_HEIGHT;
+		wb->surface_id = wl.entries[i].surface_id;
+		strncpy(wb->title, wl.entries[i].title,
+			sizeof(wb->title) - 1);
+		wb->title[sizeof(wb->title) - 1] = '\0';
+		if (strlen(wb->title) > 12)
+			wb->title[12] = '\0';
+		wb->minimized = wl.entries[i].minimized;
+		wb->hovered = 0;
+
+		x += wb->w + 4;
+		num_win_btns++;
+	}
 }
 
 /* ============================================================
@@ -324,7 +395,7 @@ static void render_panel(void)
 
 		/* 버튼 텍스트 (중앙 정렬) */
 		int text_x = btn->x + BTN_PADDING;
-		int text_y = btn->y + (btn->h - 8) / 2;
+		int text_y = btn->y + (btn->h - g_shell_font_h) / 2;
 
 		draw_string(px, w, h, text_x, text_y,
 			    btn->label, COL_TEXT_WHITE);
@@ -335,6 +406,33 @@ static void render_panel(void)
 
 			draw_rect(px, w, h, sep_x, 4, 1, h - 8,
 				  COL_SEPARATOR);
+		}
+	}
+
+	/* 2.5 윈도우 목록 구분선 + 버튼 (Class 63) */
+	if (num_win_btns > 0) {
+		/* 구분선 */
+		int sep_x = launcher_end_x + 2;
+
+		draw_rect(px, w, h, sep_x, 4, 1, h - 8,
+			  COL_SEPARATOR);
+
+		for (int i = 0; i < num_win_btns; i++) {
+			struct win_button *wb = &win_btns[i];
+			uint32_t bg_color = wb->hovered ? COL_BTN_HOVER :
+					    0x00333350;
+
+			draw_rect(px, w, h, wb->x, wb->y,
+				  wb->w, wb->h, bg_color);
+
+			int text_x = wb->x + BTN_PADDING / 2;
+			int text_y = wb->y +
+				     (wb->h - g_shell_font_h) / 2;
+
+			draw_string(px, w, h, text_x, text_y,
+				    wb->title,
+				    wb->minimized ? COL_TEXT_DIM :
+						    COL_TEXT_WHITE);
 		}
 	}
 
@@ -369,8 +467,8 @@ static void render_panel(void)
 	snprintf(clock_buf, sizeof(clock_buf), "%02d:%02d:%02d",
 		 hrs, mins, secs);
 
-	int clock_x = w - (int)strlen(clock_buf) * 8 - BTN_MARGIN;
-	int clock_y = (h - 8) / 2;
+	int clock_x = w - (int)strlen(clock_buf) * g_shell_font_w - BTN_MARGIN;
+	int clock_y = (h - g_shell_font_h) / 2;
 
 	draw_string(px, w, h, clock_x, clock_y,
 		    clock_buf, COL_TEXT_DIM);
@@ -456,6 +554,18 @@ static void on_pointer_motion(uint32_t surface_id, int x, int y)
 		}
 	}
 
+	/* 윈도우 버튼 hover (Class 63) */
+	for (int i = 0; i < num_win_btns; i++) {
+		struct win_button *wb = &win_btns[i];
+		int inside = (x >= wb->x && x < wb->x + wb->w &&
+			      y >= wb->y && y < wb->y + wb->h);
+
+		if (inside != wb->hovered) {
+			wb->hovered = inside;
+			changed = 1;
+		}
+	}
+
 	if (changed)
 		need_redraw = 1;
 }
@@ -480,7 +590,17 @@ static void on_pointer_button(uint32_t surface_id, uint32_t button,
 
 		if (btn->hovered && btn->command) {
 			launch_app(btn->command);
-			break;
+			return;
+		}
+	}
+
+	/* 윈도우 버튼 클릭 → 포커스/복원 (Class 63) */
+	for (int i = 0; i < num_win_btns; i++) {
+		struct win_button *wb = &win_btns[i];
+
+		if (wb->hovered && wb->surface_id > 0) {
+			cdp_raise_surface(conn, wb->surface_id);
+			return;
 		}
 	}
 }
@@ -502,6 +622,16 @@ int main(void)
 	sa.sa_handler = sigchld_handler;
 	sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
 	sigaction(SIGCHLD, &sa, NULL);
+
+	/* 0. PSF2 폰트 로드 (Class 61) */
+	if (psf2_load(&g_shell_psf2, "/usr/share/fonts/ter-116n.psf") == 0) {
+		g_shell_font_w = (int)g_shell_psf2.width;
+		g_shell_font_h = (int)g_shell_psf2.height;
+		printf("citcshell: PSF2 폰트 로드 %ux%u\n",
+		       g_shell_psf2.width, g_shell_psf2.height);
+	} else {
+		printf("citcshell: PSF2 없음 — font8x8 사용\n");
+	}
 
 	/* 1. CDP 컴포지터에 연결 */
 	conn = cdp_connect();
@@ -599,10 +729,11 @@ int main(void)
 			}
 		}
 
-		/* 매 루프마다 시계 업데이트 (1초 타임아웃 또는 이벤트 후) */
+		/* 매 루프마다 시계 + 윈도우 목록 업데이트 */
 		need_redraw = 1;
 
 		if (need_redraw) {
+			update_window_list();
 			render_panel();
 			cdp_commit_to(conn, panel_win);
 			need_redraw = 0;

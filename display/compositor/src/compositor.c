@@ -90,6 +90,14 @@
 /* 8x8 비트맵 폰트 (이전 수업에서 공유) */
 #include "../../fbdraw/src/font8x8.h"
 
+/* PSF2 폰트 (Class 61 추가) — 8x16 고품질 폰트 */
+#include "../../font/psf2.h"
+
+/* 전역 PSF2 폰트 (로드 실패 시 font8x8 fallback) */
+static struct psf2_font g_psf2;
+
+#define PSF2_FONT_PATH "/usr/share/fonts/ter-116n.psf"
+
 /* ============================================================
  * 상수 정의
  * ============================================================ */
@@ -100,6 +108,11 @@
 #define CLOSE_BTN_W    20    /* 닫기 버튼 너비 */
 #define WIN_TEXT_MAX   256   /* 윈도우 텍스트 버퍼 크기 */
 #define CURSOR_SIZE    12    /* 커서 크기 */
+#define RESIZE_EDGE    4     /* 리사이즈 감지 엣지 두께 (Class 59) */
+#define RESIZE_CORNER  8     /* 리사이즈 코너 크기 (Class 59) */
+#define MIN_WIN_W      100   /* 최소 윈도우 너비 (Class 59) */
+#define MIN_WIN_H      60    /* 최소 윈도우 높이 (Class 59) */
+#define BTN_W          20    /* 타이틀바 버튼 너비 (Class 59) */
 
 /* CDP (CITC Display Protocol) 상수 — Class 12 추가 */
 #define MAX_CDP_CLIENTS    4     /* 최대 동시 연결 클라이언트 */
@@ -169,6 +182,17 @@ struct window {
 	 *   - 항상 일반 윈도우 위에 렌더링
 	 */
 	int is_panel;
+
+	/*
+	 * 최소화/최대화 상태 (Class 59 추가)
+	 *
+	 * minimized: 태스크바에만 표시, 화면에서 숨김
+	 * maximized: 화면 전체 차지 (패널 영역 제외)
+	 * saved_*: 최대화 전 원래 위치/크기 저장 (복원용)
+	 */
+	int minimized;
+	int maximized;
+	int saved_x, saved_y, saved_w, saved_h;
 };
 
 /* ============================================================
@@ -206,6 +230,7 @@ struct cdp_surface {
 	uint32_t buf_height;         /* 버퍼 높이 (픽셀) */
 	uint32_t buf_stride;         /* 한 줄 바이트 수 */
 
+	uint32_t format;             /* 0=XRGB8888, 1=ARGB8888 (Class 60) */
 	int committed;                /* commit 되었는지 (렌더링 가능) */
 	int frame_requested;          /* 프레임 콜백 요청됨 */
 };
@@ -290,6 +315,32 @@ static struct {
 	/* 실행 상태 */
 	int running;
 	int need_redraw;         /* 화면 갱신 필요 플래그 */
+
+	/* 데미지 트래킹 (Class 58)
+	 *
+	 * 매 프레임 전체를 다시 그리는 대신,
+	 * 변경된 영역(데미지)만 다시 그림.
+	 *
+	 * damage_full = 1: 전체 화면 리드로 (윈도우 생성/삭제 등)
+	 * damage_full = 0: damage_rects[]에 기록된 영역만 리드로
+	 * damage_count = 0 && damage_full = 0: 리드로 불필요 (idle)
+	 */
+	struct { int x, y, w, h; } damage_rects[32];
+	int damage_count;
+	int damage_full;         /* 전체 화면 리드로 필요 */
+
+	/* 이전 커서 위치 (커서 데미지용) */
+	int prev_mouse_x, prev_mouse_y;
+
+	/* 배경 캐시 — 그래디언트를 매번 다시 계산하지 않음 */
+	uint32_t *bg_cache;
+	int bg_cache_valid;
+
+	/* 리사이즈 상태 (Class 59) */
+	int resizing;            /* 리사이즈 중인 윈도우 인덱스 (-1=없음) */
+	int resize_edge;         /* 0=none, 1=right, 2=bottom, 3=corner */
+	int resize_start_x, resize_start_y;  /* 리사이즈 시작 시 마우스 위치 */
+	int resize_orig_w, resize_orig_h;    /* 리사이즈 시작 시 원래 크기 */
 } comp;
 
 /* ============================================================
@@ -305,7 +356,71 @@ static struct {
 	struct cdp_client clients[MAX_CDP_CLIENTS];   /* 연결된 클라이언트 */
 	struct cdp_surface surfaces[MAX_CDP_SURFACES]; /* CDP surfaces */
 	uint32_t next_surface_id;                     /* 다음 surface ID */
+
+	/* 클립보드 (Class 62) */
+	char clipboard_buf[CDP_CLIPBOARD_MAX];
+	uint32_t clipboard_len;
 } cdp;
+
+/* ============================================================
+ * 데미지 트래킹 — Class 58 추가
+ * ============================================================
+ *
+ * 데미지 트래킹이란?
+ *   화면에서 변경된 영역만 다시 그리는 최적화 기법.
+ *   PulseAudio가 무음일 때 CPU를 안 쓰듯,
+ *   컴포지터도 변경 없으면 렌더링을 건너뛸 수 있음.
+ *
+ *   Wayland: wl_surface.damage_buffer() → 컴포지터가 영역 추적
+ *   X11: XDamage 확장
+ *
+ *   효과:
+ *     마우스만 이동: 12x12 영역 2개만 리드로 (이전+새 위치)
+ *     완전 idle: 렌더링 0회 (CPU 사용률 최소)
+ *     윈도우 변경: 해당 윈도우 영역만 리드로
+ */
+static void damage_reset(void)
+{
+	comp.damage_count = 0;
+	comp.damage_full = 0;
+}
+
+static void damage_add(int x, int y, int w, int h)
+{
+	if (comp.damage_full)
+		return; /* 이미 전체 리드로 예정 */
+
+	if (comp.damage_count >= 32) {
+		/* 데미지 rect가 너무 많으면 전체 리드로 */
+		comp.damage_full = 1;
+		return;
+	}
+
+	comp.damage_rects[comp.damage_count].x = x;
+	comp.damage_rects[comp.damage_count].y = y;
+	comp.damage_rects[comp.damage_count].w = w;
+	comp.damage_rects[comp.damage_count].h = h;
+	comp.damage_count++;
+}
+
+static void damage_add_full(void)
+{
+	comp.damage_full = 1;
+}
+
+static void damage_add_window(int win_idx)
+{
+	if (win_idx < 0 || win_idx >= comp.num_windows)
+		return;
+	struct window *w = &comp.windows[win_idx];
+	/* 윈도우 전체 영역 (테두리 2px 포함) */
+	damage_add(w->x - 2, w->y - 2, w->w + 4, w->h + 4);
+}
+
+static int damage_has_any(void)
+{
+	return comp.damage_full || comp.damage_count > 0;
+}
 
 /* ============================================================
  * DRM 함수들 (drmdraw.c에서 가져옴, 주석 간소화)
@@ -627,6 +742,16 @@ static void draw_rect(struct drm_buf *buf,
 static void draw_char(struct drm_buf *buf,
 		      int x, int y, char c, uint32_t color, int scale)
 {
+	/* PSF2 폰트 사용 (Class 61) */
+	if (g_psf2.loaded && scale == 1) {
+		uint32_t *fb = (uint32_t *)buf->map;
+		int stride = (int)(buf->pitch / 4);
+
+		psf2_draw_char(fb, stride, x, y, c, color, &g_psf2);
+		return;
+	}
+
+	/* font8x8 fallback */
 	unsigned char ch = (unsigned char)c;
 	if (ch > 127) return;
 
@@ -645,13 +770,21 @@ static void draw_char(struct drm_buf *buf,
 	}
 }
 
+/*
+ * 폰트 너비/높이 조회 (PSF2 또는 font8x8)
+ */
+static int font_width(void)  { return g_psf2.loaded ? (int)g_psf2.width : 8; }
+static int font_height(void) { return g_psf2.loaded ? (int)g_psf2.height : 8; }
+
 static void draw_string(struct drm_buf *buf,
 			int x, int y, const char *str,
 			uint32_t color, int scale)
 {
+	int cw = font_width() * scale;
+
 	while (*str) {
 		draw_char(buf, x, y, *str, color, scale);
-		x += 8 * scale;
+		x += cw;
 		str++;
 	}
 }
@@ -1054,6 +1187,96 @@ static int is_close_btn(struct window *w, int px, int py)
 		px >= w->x + w->w - CLOSE_BTN_W);
 }
 
+/*
+ * 최소화 버튼 영역: [X] 왼쪽 두 번째 버튼
+ * 타이틀바에서 우측으로 [—][□][X] 순서.
+ */
+static int is_minimize_btn(struct window *w, int px, int py)
+{
+	return (is_titlebar(w, px, py) &&
+		px >= w->x + w->w - CLOSE_BTN_W * 3 &&
+		px <  w->x + w->w - CLOSE_BTN_W * 2);
+}
+
+/*
+ * 최대화 버튼 영역: [X] 왼쪽 첫 번째 버튼
+ */
+static int is_maximize_btn(struct window *w, int px, int py)
+{
+	return (is_titlebar(w, px, py) &&
+		px >= w->x + w->w - CLOSE_BTN_W * 2 &&
+		px <  w->x + w->w - CLOSE_BTN_W);
+}
+
+/*
+ * 리사이즈 엣지 감지 (Class 59)
+ *
+ * 윈도우 가장자리에서 마우스를 잡아 크기 변경:
+ *   - 우하단 코너: RESIZE_CORNER x RESIZE_CORNER
+ *   - 우측 엣지: RESIZE_EDGE px
+ *   - 하단 엣지: RESIZE_EDGE px
+ *
+ * 반환: 0=없음, 1=우측, 2=하단, 3=코너(우하단)
+ */
+static int resize_edge_at(struct window *w, int px, int py)
+{
+	if (w->is_panel || w->maximized)
+		return 0; /* 패널/최대화 윈도우는 리사이즈 불가 */
+
+	int right = w->x + w->w;
+	int bottom = w->y + w->h;
+
+	/* 우하단 코너 */
+	if (px >= right - RESIZE_CORNER && px < right + 2 &&
+	    py >= bottom - RESIZE_CORNER && py < bottom + 2)
+		return 3;
+
+	/* 우측 엣지 */
+	if (px >= right - RESIZE_EDGE && px < right + 2 &&
+	    py >= w->y + TITLEBAR_H && py < bottom)
+		return 1;
+
+	/* 하단 엣지 */
+	if (py >= bottom - RESIZE_EDGE && py < bottom + 2 &&
+	    px >= w->x && px < right)
+		return 2;
+
+	return 0;
+}
+
+/*
+ * CDP configure 이벤트 전송 (Class 59)
+ *
+ * 윈도우 크기 변경 시 클라이언트에 알림.
+ * 클라이언트는 새 크기로 버퍼를 재할당해야 함.
+ */
+static void cdp_send_configure(int win_idx, int width, int height)
+{
+	struct window *w = &comp.windows[win_idx];
+
+	if (w->cdp_surface_idx < 0)
+		return;
+
+	int sidx = w->cdp_surface_idx;
+
+	if (sidx >= MAX_CDP_SURFACES || !cdp.surfaces[sidx].active)
+		return;
+
+	int cfd = cdp.clients[cdp.surfaces[sidx].client_idx].fd;
+
+	if (cfd < 0)
+		return;
+
+	struct cdp_configure evt;
+	evt.surface_id = (uint32_t)(sidx + 1);
+	evt.width = width;
+	evt.height = height;
+
+	fcntl(cfd, F_SETFL, 0);
+	cdp_send_msg(cfd, CDP_EVT_CONFIGURE, &evt, sizeof(evt));
+	fcntl(cfd, F_SETFL, O_NONBLOCK);
+}
+
 /* ============================================================
  * CDP 서버 기능 — Class 12 추가
  * ============================================================
@@ -1325,6 +1548,7 @@ static void cdp_disconnect_client(int client_idx)
 
 	close(client_fd);
 	cdp.clients[client_idx].fd = -1;
+	damage_add_full();
 	comp.need_redraw = 1;
 }
 
@@ -1416,6 +1640,7 @@ static void cdp_handle_client_msg(int client_idx)
 		printf("CDP: surface %u 생성 (client=%d, window=%d, %dx%d)\n",
 		       surface_id, client_idx, win_idx,
 		       req->width, req->height);
+		damage_add_full();
 		comp.need_redraw = 1;
 		break;
 	}
@@ -1476,9 +1701,11 @@ static void cdp_handle_client_msg(int client_idx)
 		surf->buf_width = req->width;
 		surf->buf_height = req->height;
 		surf->buf_stride = req->stride;
+		surf->format = req->format;  /* 0=XRGB, 1=ARGB (Class 60) */
 
-		printf("CDP: surface %u 버퍼 연결 (%ux%u, %u bytes)\n",
-		       req->surface_id, req->width, req->height, shm_size);
+		printf("CDP: surface %u 버퍼 연결 (%ux%u, fmt=%u, %u bytes)\n",
+		       req->surface_id, req->width, req->height, req->format,
+		       shm_size);
 		break;
 	}
 
@@ -1497,6 +1724,7 @@ static void cdp_handle_client_msg(int client_idx)
 			break;
 
 		cdp.surfaces[sidx].committed = 1;
+		damage_add_window(cdp.surfaces[sidx].window_idx);
 		comp.need_redraw = 1;
 		break;
 	}
@@ -1533,6 +1761,7 @@ static void cdp_handle_client_msg(int client_idx)
 			memcpy(comp.windows[wi].title, req->title,
 			       sizeof(comp.windows[wi].title) - 1);
 			comp.windows[wi].title[sizeof(comp.windows[wi].title) - 1] = '\0';
+			damage_add_window(wi);
 			comp.need_redraw = 1;
 		}
 		break;
@@ -1580,6 +1809,7 @@ static void cdp_handle_client_msg(int client_idx)
 			printf("CDP: surface %u → panel (edge=%u, %dx%d at y=%d)\n",
 			       req->surface_id, req->edge,
 			       w->w, w->h, w->y);
+			damage_add_full();
 			comp.need_redraw = 1;
 		}
 		break;
@@ -1609,7 +1839,140 @@ static void cdp_handle_client_msg(int client_idx)
 		surf->shm_map = NULL;
 
 		printf("CDP: surface %u 삭제됨\n", req->surface_id);
+		damage_add_full();
 		comp.need_redraw = 1;
+		break;
+	}
+
+	case CDP_REQ_DAMAGE: {
+		struct cdp_damage *req = (struct cdp_damage *)payload;
+		int sidx = cdp_surface_index(req->surface_id);
+
+		if (sidx >= 0) {
+			int wi = cdp.surfaces[sidx].window_idx;
+
+			if (wi >= 0 && wi < comp.num_windows) {
+				struct window *w = &comp.windows[wi];
+				/* 클라이언트가 보고한 영역을 화면 좌표로 변환 */
+				damage_add(w->x + (int)req->x,
+					   w->y + TITLEBAR_H + (int)req->y,
+					   (int)req->w, (int)req->h);
+			}
+		}
+		comp.need_redraw = 1;
+		break;
+	}
+
+	case CDP_REQ_SET_MODE: {
+		/* 해상도 변경 — 현재는 로그만 (DRM 모드셋은 부팅 시 고정) */
+		struct cdp_set_mode *req = (struct cdp_set_mode *)payload;
+
+		printf("CDP: SET_MODE 요청 %ux%u@%uHz (현재 미지원)\n",
+		       req->width, req->height, req->refresh);
+		break;
+	}
+
+	case CDP_REQ_LIST_WINDOWS: {
+		/* 열린 윈도우 목록 전송 */
+		struct cdp_window_list resp;
+
+		memset(&resp, 0, sizeof(resp));
+		int cnt = 0;
+
+		for (int i = 0; i < comp.num_windows && cnt < CDP_MAX_WINLIST; i++) {
+			struct window *w = &comp.windows[i];
+
+			if (w->is_panel)
+				continue; /* 패널 제외 */
+
+			resp.entries[cnt].surface_id =
+				(w->cdp_surface_idx >= 0) ?
+				(uint32_t)(w->cdp_surface_idx + 1) : 0;
+			strncpy(resp.entries[cnt].title, w->title,
+				sizeof(resp.entries[cnt].title) - 1);
+			resp.entries[cnt].minimized = w->minimized;
+			cnt++;
+		}
+		resp.count = (uint32_t)cnt;
+
+		uint32_t msg_size = sizeof(uint32_t) +
+				    (uint32_t)cnt * sizeof(struct cdp_window_entry);
+
+		cdp_send_msg(client_fd, CDP_EVT_WINDOW_LIST,
+			     &resp, msg_size);
+		break;
+	}
+
+	case CDP_REQ_RAISE_SURFACE: {
+		struct cdp_raise_surface *req =
+			(struct cdp_raise_surface *)payload;
+		int sidx = cdp_surface_index(req->surface_id);
+
+		if (sidx >= 0) {
+			int wi = cdp.surfaces[sidx].window_idx;
+
+			if (wi >= 0 && wi < comp.num_windows) {
+				struct window *w = &comp.windows[wi];
+
+				/* 최소화 해제 */
+				if (w->minimized)
+					w->minimized = 0;
+				w->visible = 1;
+
+				/* Z-order: 맨 위로 올리기 */
+				if (wi != comp.num_windows - 1) {
+					struct window tmp = *w;
+					/* 윈도우를 배열 끝으로 이동 */
+					for (int j = wi; j < comp.num_windows - 1; j++)
+						comp.windows[j] = comp.windows[j + 1];
+					comp.windows[comp.num_windows - 1] = tmp;
+					/* cdp_surface의 window_idx 갱신 */
+					for (int j = 0; j < MAX_CDP_SURFACES; j++) {
+						if (cdp.surfaces[j].active &&
+						    cdp.surfaces[j].window_idx > wi)
+							cdp.surfaces[j].window_idx--;
+					}
+					if (tmp.cdp_surface_idx >= 0)
+						cdp.surfaces[tmp.cdp_surface_idx].window_idx =
+							comp.num_windows - 1;
+				}
+				comp.focused = comp.num_windows - 1;
+				comp.need_redraw = 1;
+				damage_add_full();
+			}
+		}
+		break;
+	}
+
+	case CDP_REQ_CLIPBOARD_SET: {
+		struct cdp_clipboard_set *req =
+			(struct cdp_clipboard_set *)payload;
+
+		if (req->len > 0 && req->len <= CDP_CLIPBOARD_MAX) {
+			memcpy(cdp.clipboard_buf, req->text, req->len);
+			cdp.clipboard_len = req->len;
+			if (req->len < CDP_CLIPBOARD_MAX)
+				cdp.clipboard_buf[req->len] = '\0';
+		}
+		break;
+	}
+
+	case CDP_REQ_CLIPBOARD_GET: {
+		/* 요청 클라이언트에 클립보드 데이터 전송 */
+		struct cdp_clipboard_data resp;
+
+		resp.len = cdp.clipboard_len;
+		if (cdp.clipboard_len > 0)
+			memcpy(resp.text, cdp.clipboard_buf,
+			       cdp.clipboard_len);
+		if (cdp.clipboard_len < CDP_CLIPBOARD_MAX)
+			resp.text[cdp.clipboard_len] = '\0';
+
+		uint32_t msg_size = sizeof(uint32_t) +
+				    cdp.clipboard_len + 1;
+
+		cdp_send_msg(client_fd, CDP_EVT_CLIPBOARD_DATA,
+			     &resp, msg_size);
 		break;
 	}
 
@@ -1657,6 +2020,8 @@ static void cdp_route_key(uint32_t keycode, uint32_t state, char character)
 	evt.keycode = keycode;
 	evt.state = state;
 	evt.character = (uint32_t)character;
+	evt.modifiers = (shift_held ? CDP_MOD_SHIFT : 0) |
+			(ctrl_held ? CDP_MOD_CTRL : 0);
 
 	fcntl(client_fd, F_SETFL, 0);
 	cdp_send_msg(client_fd, CDP_EVT_KEY, &evt, sizeof(evt));
@@ -1785,29 +2150,139 @@ static void cdp_send_frame_callbacks(void)
  * 여기서는 간단히 불투명 덧그리기만 합니다.
  */
 
-/* 배경: 부드러운 그라디언트 */
-static void render_background(struct drm_buf *buf)
+/*
+ * 배경 캐시 생성 (Class 58 추가)
+ *
+ * 그래디언트를 매 프레임 계산하면 느림.
+ * 한 번만 계산하고 캐시하면 memcpy로 빠르게 복사 가능.
+ */
+
+/*
+ * 알파 블렌딩 (Class 60)
+ *
+ * ARGB 픽셀의 알파 채널을 이용하여 반투명 합성.
+ * Porter-Duff "source over" 연산:
+ *   result = src * src_alpha + dst * (1 - src_alpha)
+ *
+ * 최적화:
+ *   sa == 0xFF → 불투명: dst = src (memcpy와 동일)
+ *   sa == 0x00 → 완전 투명: dst 유지
+ *   그 외 → 채널별 블렌딩
+ */
+static inline uint32_t alpha_blend(uint32_t dst, uint32_t src)
 {
+	uint32_t sa = (src >> 24) & 0xFF;
+
+	if (sa == 0xFF) return src;     /* 불투명 — 빠른 경로 */
+	if (sa == 0x00) return dst;     /* 완전 투명 */
+
+	uint32_t da = 255 - sa;
+	uint32_t r = ((((src >> 16) & 0xFF) * sa) +
+		      (((dst >> 16) & 0xFF) * da)) / 255;
+	uint32_t g = ((((src >> 8) & 0xFF) * sa) +
+		      (((dst >> 8) & 0xFF) * da)) / 255;
+	uint32_t b = (((src & 0xFF) * sa) +
+		      ((dst & 0xFF) * da)) / 255;
+
+	return (0xFF << 24) | (r << 16) | (g << 8) | b;
+}
+
+/*
+ * 반투명 사각형 그리기 (Class 60)
+ * 윈도우 그림자에 사용.
+ */
+static void draw_rect_alpha(struct drm_buf *buf, int x, int y,
+			    int w, int h, uint32_t argb)
+{
+	for (int dy = 0; dy < h; dy++) {
+		int py = y + dy;
+
+		if (py < 0 || (uint32_t)py >= buf->height)
+			continue;
+
+		uint32_t *row = (uint32_t *)(buf->map + (uint32_t)py * buf->pitch);
+
+		for (int dx = 0; dx < w; dx++) {
+			int px = x + dx;
+
+			if (px < 0 || (uint32_t)px >= buf->width)
+				continue;
+			row[px] = alpha_blend(row[px], argb);
+		}
+	}
+}
+
+/*
+ * 배경 이미지 로드 시도 (Class 61)
+ *
+ * /usr/share/wallpaper.raw — XRGB8888 원시 데이터
+ * 크기가 화면과 정확히 맞아야 함 (width × height × 4 bytes).
+ * 없으면 그래디언트 fallback.
+ */
+#define WALLPAPER_PATH "/usr/share/wallpaper.raw"
+
+static void render_background_cache(struct drm_buf *buf)
+{
+	if (!comp.bg_cache) {
+		comp.bg_cache = malloc(buf->width * buf->height * 4);
+		if (!comp.bg_cache) return;
+	}
+
+	/* 배경 이미지 시도 */
+	uint32_t expected = buf->width * buf->height * 4;
+	int wfd = open(WALLPAPER_PATH, O_RDONLY);
+
+	if (wfd >= 0) {
+		ssize_t rd = read(wfd, comp.bg_cache, expected);
+		close(wfd);
+		if ((uint32_t)rd == expected) {
+			comp.bg_cache_valid = 1;
+			printf("compositor: wallpaper loaded (%ux%u)\n",
+			       buf->width, buf->height);
+			return;
+		}
+	}
+
+	/* 그래디언트 fallback */
 	for (uint32_t y = 0; y < buf->height; y++) {
-		uint32_t *line = (uint32_t *)(buf->map + y * buf->pitch);
+		uint32_t *line = comp.bg_cache + y * buf->width;
 		uint8_t r = 20 + 15 * y / buf->height;
 		uint8_t g = 25 + 20 * y / buf->height;
-		uint8_t b = 50 + 30 * y / buf->height;
-		uint32_t color = rgb(r, g, b);
+		uint8_t b_val = 50 + 30 * y / buf->height;
+		uint32_t color = rgb(r, g, b_val);
 		for (uint32_t x = 0; x < buf->width; x++)
 			line[x] = color;
 	}
+	comp.bg_cache_valid = 1;
+}
+
+/* 배경: 캐시에서 복사 + 상단 바 */
+static void render_background(struct drm_buf *buf)
+{
+	/* 캐시가 없으면 생성 */
+	if (!comp.bg_cache_valid)
+		render_background_cache(buf);
+
+	/* 캐시에서 프레임버퍼로 복사 */
+	if (comp.bg_cache) {
+		for (uint32_t y = 0; y < buf->height; y++) {
+			uint32_t *dst = (uint32_t *)(buf->map + y * buf->pitch);
+			uint32_t *src = comp.bg_cache + y * buf->width;
+			memcpy(dst, src, buf->width * 4);
+		}
+	}
 
 	/* 상단 바 (태스크바 느낌) */
-	draw_rect(buf, 0, 0, buf->width, 20, rgb(30, 30, 50));
-	draw_string(buf, 8, 4, "CITC OS Compositor", rgb(180, 180, 220), 1);
+	int bar_h = font_height() + 4;
+	draw_rect(buf, 0, 0, buf->width, bar_h, rgb(30, 30, 50));
+	draw_string(buf, 8, 2, "CITC OS Compositor", rgb(180, 180, 220), 1);
 
 	/* 우측에 시스템 정보 */
 	char info[64];
 	snprintf(info, sizeof(info), "Windows: %d  Mouse: %d,%d",
 		 comp.num_windows, comp.mouse_x, comp.mouse_y);
-	int info_x = buf->width - strlen(info) * 8 - 8;
-	draw_string(buf, info_x, 4, info, rgb(120, 120, 160), 1);
+	int info_x = (int)(buf->width - strlen(info) * (uint32_t)font_width() - 8);
+	draw_string(buf, info_x, 2, info, rgb(120, 120, 160), 1);
 }
 
 /* 윈도우 하나 렌더링 */
@@ -1846,6 +2321,8 @@ static void render_window(struct drm_buf *buf, struct window *win, int focused)
 					uint32_t *dst = (uint32_t *)
 						(buf->map + (uint32_t)dst_y * buf->pitch);
 
+					int use_alpha = (surf->format == 1);
+
 					for (uint32_t sx = 0; sx < surf->buf_width; sx++) {
 						int dst_x = win->x + (int)sx;
 
@@ -1854,7 +2331,10 @@ static void render_window(struct drm_buf *buf, struct window *win, int focused)
 						if (dst_x >= win->x + win->w)
 							break;
 
-						dst[dst_x] = src[sx];
+						if (use_alpha)
+							dst[dst_x] = alpha_blend(dst[dst_x], src[sx]);
+						else
+							dst[dst_x] = src[sx];
 					}
 				}
 			}
@@ -1878,6 +2358,10 @@ static void render_window(struct drm_buf *buf, struct window *win, int focused)
 		border_color = rgb(60, 60, 80);
 	}
 
+	/* 윈도우 그림자 (Class 60) — 오프셋 (4,4) 반투명 검정 */
+	draw_rect_alpha(buf, win->x + 4, win->y + 4,
+			win->w, win->h, 0x40000000);
+
 	/* 테두리 (2px) */
 	draw_rect(buf, win->x - 2, win->y - 2,
 		  win->w + 4, win->h + 4, border_color);
@@ -1890,11 +2374,28 @@ static void render_window(struct drm_buf *buf, struct window *win, int focused)
 	draw_string(buf, win->x + 6, win->y + 6,
 		    win->title, rgb(255, 255, 255), 1);
 
-	/* 닫기 버튼 [X] */
+	/* 타이틀바 버튼: [—][□][X] (Class 59) */
 	int close_x = win->x + win->w - CLOSE_BTN_W;
+	int max_x   = close_x - CLOSE_BTN_W;
+	int min_x   = max_x - CLOSE_BTN_W;
+
+	/* 닫기 버튼 [X] — 빨간색 */
 	draw_rect(buf, close_x, win->y, CLOSE_BTN_W, TITLEBAR_H,
 		  rgb(200, 60, 60));
 	draw_char(buf, close_x + 6, win->y + 6, 'X',
+		  rgb(255, 255, 255), 1);
+
+	/* 최대화 버튼 [□] — 회색 */
+	draw_rect(buf, max_x, win->y, CLOSE_BTN_W, TITLEBAR_H,
+		  rgb(80, 80, 100));
+	draw_char(buf, max_x + 6, win->y + 6,
+		  win->maximized ? 'R' : '#',
+		  rgb(255, 255, 255), 1);
+
+	/* 최소화 버튼 [—] — 회색 */
+	draw_rect(buf, min_x, win->y, CLOSE_BTN_W, TITLEBAR_H,
+		  rgb(80, 80, 100));
+	draw_char(buf, min_x + 6, win->y + 6, '-',
 		  rgb(255, 255, 255), 1);
 
 	/* 클라이언트 영역 (내용 부분) */
@@ -1949,6 +2450,8 @@ static void render_window(struct drm_buf *buf, struct window *win, int focused)
 				uint32_t *dst = (uint32_t *)
 					(buf->map + (uint32_t)dst_y * buf->pitch);
 
+				int use_alpha = (surf->format == 1);
+
 				for (uint32_t sx = 0; sx < surf->buf_width; sx++) {
 					int dst_x = win->x + (int)sx;
 
@@ -1957,7 +2460,10 @@ static void render_window(struct drm_buf *buf, struct window *win, int focused)
 					if (dst_x >= win->x + win->w)
 						break;
 
-					dst[dst_x] = src[sx];
+					if (use_alpha)
+						dst[dst_x] = alpha_blend(dst[dst_x], src[sx]);
+					else
+						dst[dst_x] = src[sx];
 				}
 			}
 		}
@@ -2036,7 +2542,17 @@ static void render_cursor(struct drm_buf *buf)
 	}
 }
 
-/* 전체 프레임 렌더링 */
+/*
+ * 전체 프레임 렌더링
+ *
+ * Class 58 변경: 데미지 기반 렌더링.
+ *   - damage_has_any() = 0: 렌더링 건너뛰기 (idle 절전)
+ *   - damage_full = 1: 전체 리드로 (기존 방식)
+ *   - 부분 데미지: 전체 리드로 (추후 최적화 가능)
+ *
+ * 현재 구현은 "skip idle frames" 최적화에 집중.
+ * 변경이 없으면 render_frame 자체를 호출하지 않음.
+ */
 static void render_frame(void)
 {
 	struct drm_buf *buf = back_buf();
@@ -2078,6 +2594,9 @@ static void render_frame(void)
 
 	/* 6. CDP 프레임 콜백 전송 (Class 12 추가) */
 	cdp_send_frame_callbacks();
+
+	/* 7. 데미지 리셋 — 다음 프레임까지 다시 축적 */
+	damage_reset();
 }
 
 /* ============================================================
@@ -2134,6 +2653,22 @@ static void handle_mouse_event(struct input_dev *dev,
 			w->y = comp.mouse_y - comp.drag_off_y;
 		}
 
+		/* 리사이즈 중이면 윈도우 크기 변경 (Class 59) */
+		if (comp.resizing >= 0 && comp.mouse_btn_left) {
+			struct window *rw = &comp.windows[comp.resizing];
+			int dx = comp.mouse_x - comp.resize_start_x;
+			int dy = comp.mouse_y - comp.resize_start_y;
+			int nw = comp.resize_orig_w;
+			int nh = comp.resize_orig_h;
+
+			if (comp.resize_edge & 1) nw += dx; /* 우측 */
+			if (comp.resize_edge & 2) nh += dy; /* 하단 */
+			if (nw < MIN_WIN_W) nw = MIN_WIN_W;
+			if (nh < MIN_WIN_H) nh = MIN_WIN_H;
+			rw->w = nw;
+			rw->h = nh;
+		}
+
 		/* CDP: 마우스 이동 전달 (Class 12) */
 		/*
 		 * Class 17: 패널에도 모션 이벤트를 전달.
@@ -2171,6 +2706,15 @@ static void handle_mouse_event(struct input_dev *dev,
 			}
 		}
 
+		/* 데미지: 이전 커서 위치 + 새 커서 위치 */
+		damage_add(comp.prev_mouse_x, comp.prev_mouse_y,
+			   CURSOR_SIZE, CURSOR_SIZE);
+		damage_add(comp.mouse_x, comp.mouse_y,
+			   CURSOR_SIZE, CURSOR_SIZE);
+		if (comp.dragging >= 0 || comp.resizing >= 0)
+			damage_add_full(); /* 드래그/리사이즈 중 → 전체 리드로 */
+		comp.prev_mouse_x = comp.mouse_x;
+		comp.prev_mouse_y = comp.mouse_y;
 		comp.need_redraw = 1;
 
 	} else if (ev->type == EV_ABS) {
@@ -2210,6 +2754,22 @@ static void handle_mouse_event(struct input_dev *dev,
 			w->y = comp.mouse_y - comp.drag_off_y;
 		}
 
+		/* 리사이즈 중이면 윈도우 크기 변경 (Class 59) */
+		if (comp.resizing >= 0 && comp.mouse_btn_left) {
+			struct window *rw = &comp.windows[comp.resizing];
+			int dx = comp.mouse_x - comp.resize_start_x;
+			int dy = comp.mouse_y - comp.resize_start_y;
+			int nw = comp.resize_orig_w;
+			int nh = comp.resize_orig_h;
+
+			if (comp.resize_edge & 1) nw += dx;
+			if (comp.resize_edge & 2) nh += dy;
+			if (nw < MIN_WIN_W) nw = MIN_WIN_W;
+			if (nh < MIN_WIN_H) nh = MIN_WIN_H;
+			rw->w = nw;
+			rw->h = nh;
+		}
+
 		/* CDP: 마우스 이동 전달 (패널 + 포커스 윈도우) */
 		{
 			int hover_idx = window_at_point(comp.mouse_x,
@@ -2242,6 +2802,15 @@ static void handle_mouse_event(struct input_dev *dev,
 			}
 		}
 
+		/* 데미지: 이전 커서 위치 + 새 커서 위치 */
+		damage_add(comp.prev_mouse_x, comp.prev_mouse_y,
+			   CURSOR_SIZE, CURSOR_SIZE);
+		damage_add(comp.mouse_x, comp.mouse_y,
+			   CURSOR_SIZE, CURSOR_SIZE);
+		if (comp.dragging >= 0 || comp.resizing >= 0)
+			damage_add_full();
+		comp.prev_mouse_x = comp.mouse_x;
+		comp.prev_mouse_y = comp.mouse_y;
 		comp.need_redraw = 1;
 
 	} else if (ev->type == EV_KEY) {
@@ -2298,17 +2867,66 @@ static void handle_mouse_event(struct input_dev *dev,
 						} else {
 							w->visible = 0;
 						}
+					} else if (is_minimize_btn(w, comp.mouse_x,
+								   comp.mouse_y)) {
+						/* 최소화 버튼 (Class 59) */
+						w->minimized = 1;
+						w->visible = 0;
+						if (comp.focused == idx)
+							comp.focused = -1;
+					} else if (is_maximize_btn(w, comp.mouse_x,
+								   comp.mouse_y)) {
+						/* 최대화/복원 토글 (Class 59) */
+						if (w->maximized) {
+							w->x = w->saved_x;
+							w->y = w->saved_y;
+							w->w = w->saved_w;
+							w->h = w->saved_h;
+							w->maximized = 0;
+						} else {
+							w->saved_x = w->x;
+							w->saved_y = w->y;
+							w->saved_w = w->w;
+							w->saved_h = w->h;
+							w->x = 0;
+							w->y = 0;
+							w->w = (int)drm.mode.hdisplay;
+							int ph = 0;
+							for (int pi = 0; pi < comp.num_windows; pi++) {
+								if (comp.windows[pi].is_panel &&
+								    comp.windows[pi].visible)
+									ph = comp.windows[pi].h;
+							}
+							w->h = (int)drm.mode.vdisplay - ph;
+							w->maximized = 1;
+						}
+						cdp_send_configure(idx, w->w,
+								   w->h - TITLEBAR_H);
 					} else {
-						/* 포커스 변경 */
-						window_focus(idx);
+						int edge = resize_edge_at(w, comp.mouse_x,
+									  comp.mouse_y);
+						if (edge > 0) {
+							/* 리사이즈 시작 (Class 59) */
+							window_focus(idx);
+							w = &comp.windows[comp.num_windows - 1];
+							comp.resizing = comp.num_windows - 1;
+							comp.resize_edge = edge;
+							comp.resize_start_x = comp.mouse_x;
+							comp.resize_start_y = comp.mouse_y;
+							comp.resize_orig_w = w->w;
+							comp.resize_orig_h = w->h;
+						} else {
+							/* 포커스 변경 */
+							window_focus(idx);
 
-						/* 타이틀바면 드래그 시작 */
-						w = &comp.windows[comp.num_windows - 1];
-						if (is_titlebar(w, comp.mouse_x,
-								comp.mouse_y)) {
-							comp.dragging = comp.num_windows - 1;
-							comp.drag_off_x = comp.mouse_x - w->x;
-							comp.drag_off_y = comp.mouse_y - w->y;
+							/* 타이틀바면 드래그 시작 */
+							w = &comp.windows[comp.num_windows - 1];
+							if (is_titlebar(w, comp.mouse_x,
+									comp.mouse_y)) {
+								comp.dragging = comp.num_windows - 1;
+								comp.drag_off_x = comp.mouse_x - w->x;
+								comp.drag_off_y = comp.mouse_y - w->y;
+							}
 						}
 					}
 				} else {
@@ -2316,12 +2934,21 @@ static void handle_mouse_event(struct input_dev *dev,
 				}
 				/* CDP: 버튼 이벤트 전달 (Class 12) */
 				cdp_route_pointer_button(BTN_LEFT, 1);
+				damage_add_full(); /* 포커스/Z-order 변경 → 전체 리드로 */
 				comp.need_redraw = 1;
 
 			} else if (ev->value == 0) {
 				/* 왼쪽 버튼 해제 */
 				comp.mouse_btn_left = 0;
 				comp.dragging = -1;
+
+				/* 리사이즈 종료 → configure 전송 (Class 59) */
+				if (comp.resizing >= 0) {
+					struct window *rw = &comp.windows[comp.resizing];
+					cdp_send_configure(comp.resizing, rw->w,
+							   rw->h - TITLEBAR_H);
+					comp.resizing = -1;
+				}
 
 				/* CDP: 버튼 해제 — 패널 포함 전달 */
 				int hover = window_at_point(comp.mouse_x,
@@ -2431,6 +3058,7 @@ static void handle_keyboard_event(struct input_event *ev)
 		}
 	}
 
+	damage_add_window(comp.focused);
 	comp.need_redraw = 1;
 }
 
@@ -2473,10 +3101,14 @@ static void event_loop(void)
 
 	/* 초기 화면 그리기 */
 	comp.need_redraw = 1;
+	damage_add_full();
 
 	while (comp.running) {
-		/* 화면 갱신이 필요하면 그리기 */
-		if (comp.need_redraw) {
+		/*
+		 * 화면 갱신: need_redraw 플래그 + 데미지가 있을 때만.
+		 * idle 상태에서는 렌더링을 완전히 건너뜀 (Class 58).
+		 */
+		if (comp.need_redraw && damage_has_any()) {
 			render_frame();
 			comp.need_redraw = 0;
 		}
@@ -2530,7 +3162,10 @@ static void event_loop(void)
 		}
 
 		if (ret == 0) {
-			comp.need_redraw = 1;
+			/* 타임아웃: idle — 리드로 불필요 (Class 58 변경)
+			 * 이전: 매 100ms마다 전체 리드로 → CPU 낭비
+			 * 변경: 변경 없으면 건너뜀
+			 */
 			continue;
 		}
 
@@ -2615,19 +3250,28 @@ int main(void)
 		return 1;
 	}
 
-	/* 3. CDP server init (Class 12) */
-	printf("[3/4] CDP server init...\n");
+	/* 3. PSF2 폰트 로드 (Class 61) */
+	if (psf2_load(&g_psf2, PSF2_FONT_PATH) == 0) {
+		printf("  PSF2 font: %ux%u, %u glyphs\n",
+		       g_psf2.width, g_psf2.height, g_psf2.numglyph);
+	} else {
+		printf("  PSF2 font not found, using font8x8 fallback\n");
+	}
+
+	/* 4. CDP server init (Class 12) */
+	printf("[4/5] CDP server init...\n");
 	if (cdp_server_init() < 0)
 		printf("  Warning: CDP server failed (internal windows only)\n");
 
-	/* 4. Window creation */
-	printf("[4/4] Window creation...\n\n");
+	/* 5. Window creation */
+	printf("[5/5] Window creation...\n\n");
 
 	/* 마우스를 화면 중앙에 배치 */
 	comp.mouse_x = drm.mode.hdisplay / 2;
 	comp.mouse_y = drm.mode.vdisplay / 2;
 	comp.focused = -1;
 	comp.dragging = -1;
+	comp.resizing = -1;
 	comp.running = 1;
 
 	/*

@@ -59,7 +59,7 @@
  * 프로토콜 상수
  * ============================================================ */
 #define CDP_VERSION        1
-#define CDP_MSG_MAX_PAYLOAD  256   /* 최대 payload 크기 */
+#define CDP_MSG_MAX_PAYLOAD  4352  /* 최대 payload 크기 (클립보드 4KB 지원) */
 
 /* ============================================================
  * 메시지 헤더
@@ -159,6 +159,52 @@ enum cdp_request {
 	 * CDP에서는 단순화하여 bottom 패널만 지원.
 	 */
 	CDP_REQ_SET_PANEL       = 7,
+
+	/*
+	 * 데미지 영역 보고 (클라이언트 → 서버)
+	 * Wayland: wl_surface.damage_buffer()
+	 *
+	 * 클라이언트가 버퍼의 어떤 부분을 변경했는지 알려줌.
+	 * 컴포지터는 이 영역만 다시 합성하여 CPU를 절약.
+	 * 보고하지 않으면 전체 surface를 다시 그림.
+	 */
+	CDP_REQ_DAMAGE          = 8,
+
+	/*
+	 * 클립보드 텍스트 설정 (Class 62)
+	 * Wayland: zwp_primary_selection_source_v1 / wl_data_source
+	 *
+	 * 앱이 "복사"할 때 클립보드 내용을 서버에 저장.
+	 */
+	CDP_REQ_CLIPBOARD_SET   = 9,
+
+	/*
+	 * 클립보드 텍스트 요청 (Class 62)
+	 * Wayland: wl_data_offer.receive()
+	 *
+	 * 앱이 "붙여넣기"할 때 클립보드 내용을 서버에 요청.
+	 * 서버는 CDP_EVT_CLIPBOARD_DATA로 응답.
+	 */
+	CDP_REQ_CLIPBOARD_GET   = 10,
+
+	/*
+	 * 화면 모드 변경 (Class 63)
+	 * 해상도/주사율 변경 요청.
+	 * 성공 시 모든 클라이언트에 CDP_EVT_CONFIGURE 전송.
+	 */
+	CDP_REQ_SET_MODE        = 11,
+
+	/*
+	 * 윈도우 목록 요청 (Class 63)
+	 * 셸이 열린 윈도우 제목 목록을 가져옴.
+	 */
+	CDP_REQ_LIST_WINDOWS    = 12,
+
+	/*
+	 * 윈도우 포커스/복원 요청 (Class 63)
+	 * 셸이 태스크바 클릭 시 해당 윈도우를 포커스+복원.
+	 */
+	CDP_REQ_RAISE_SURFACE   = 13,
 };
 
 /* ============================================================
@@ -223,6 +269,31 @@ enum cdp_event {
 	CDP_EVT_FOCUS_IN        = 121,
 	/* Wayland: wl_keyboard.leave — 이 surface가 포커스 잃음 */
 	CDP_EVT_FOCUS_OUT       = 122,
+
+	/*
+	 * 윈도우 크기 변경 알림 (Class 59)
+	 * Wayland: xdg_toplevel.configure()
+	 *
+	 * 컴포지터가 윈도우 크기를 변경했을 때 클라이언트에 알림.
+	 * 클라이언트는 새 크기에 맞게 버퍼를 재할당하고
+	 * attach + commit으로 새 내용을 제출해야 함.
+	 */
+	CDP_EVT_CONFIGURE       = 130,
+
+	/*
+	 * 클립보드 데이터 전달 (Class 62)
+	 * 서버 → 요청 클라이언트
+	 *
+	 * CDP_REQ_CLIPBOARD_GET에 대한 응답.
+	 * payload = struct cdp_clipboard_data (가변 길이 텍스트 포함)
+	 */
+	CDP_EVT_CLIPBOARD_DATA  = 140,
+
+	/*
+	 * 윈도우 목록 응답 (Class 63)
+	 * 열린 윈도우의 ID와 제목 목록.
+	 */
+	CDP_EVT_WINDOW_LIST     = 141,
 };
 
 /* ============================================================
@@ -275,6 +346,13 @@ struct cdp_destroy_surface {
 	uint32_t surface_id;
 };
 
+/* CDP_REQ_DAMAGE의 payload */
+struct cdp_damage {
+	uint32_t surface_id;
+	int32_t x, y;           /* surface-local 좌표 */
+	int32_t w, h;            /* 변경 영역 크기 */
+};
+
 /* CDP_EVT_WELCOME의 payload */
 struct cdp_welcome {
 	uint32_t screen_width;
@@ -317,10 +395,14 @@ struct cdp_pointer_leave {
 };
 
 /* CDP_EVT_KEY의 payload */
+#define CDP_MOD_SHIFT  1
+#define CDP_MOD_CTRL   2
+
 struct cdp_key {
 	uint32_t keycode;        /* Linux keycode (KEY_A 등) */
 	uint32_t state;          /* 1=pressed, 0=released */
 	uint32_t character;      /* ASCII 변환 결과 (0이면 변환 불가) */
+	uint32_t modifiers;      /* 비트마스크: CDP_MOD_SHIFT | CDP_MOD_CTRL */
 };
 
 /* CDP_EVT_FOCUS_IN의 payload */
@@ -330,6 +412,52 @@ struct cdp_focus_in {
 
 /* CDP_EVT_FOCUS_OUT의 payload */
 struct cdp_focus_out {
+	uint32_t surface_id;
+};
+
+/* CDP_EVT_CONFIGURE의 payload (Class 59) */
+struct cdp_configure {
+	uint32_t surface_id;
+	int32_t width, height;   /* 새 클라이언트 영역 크기 */
+};
+
+/* CDP_REQ_CLIPBOARD_SET의 payload (Class 62) */
+#define CDP_CLIPBOARD_MAX  4096
+struct cdp_clipboard_set {
+	uint32_t len;            /* 텍스트 길이 (바이트, null 미포함) */
+	char text[CDP_CLIPBOARD_MAX]; /* UTF-8 텍스트 (null-terminated) */
+};
+
+/* CDP_REQ_CLIPBOARD_GET의 payload (Class 62) — 빈 payload (없음) */
+
+/* CDP_EVT_CLIPBOARD_DATA의 payload (Class 62) */
+struct cdp_clipboard_data {
+	uint32_t len;            /* 텍스트 길이 (바이트, null 미포함) */
+	char text[CDP_CLIPBOARD_MAX]; /* UTF-8 텍스트 (null-terminated) */
+};
+
+/* CDP_REQ_SET_MODE의 payload (Class 63) */
+struct cdp_set_mode {
+	uint32_t width;
+	uint32_t height;
+	uint32_t refresh;        /* Hz (0=기본값) */
+};
+
+/* CDP_EVT_WINDOW_LIST의 payload (Class 63) */
+#define CDP_MAX_WINLIST  8
+struct cdp_window_entry {
+	uint32_t surface_id;
+	char title[32];
+	int32_t minimized;       /* 1=최소화 상태 */
+};
+
+struct cdp_window_list {
+	uint32_t count;
+	struct cdp_window_entry entries[CDP_MAX_WINLIST];
+};
+
+/* CDP_REQ_RAISE_SURFACE의 payload (Class 63) */
+struct cdp_raise_surface {
 	uint32_t surface_id;
 };
 

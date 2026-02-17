@@ -59,6 +59,13 @@
 /* 8x8 비트맵 폰트 */
 #include "../../fbdraw/src/font8x8.h"
 
+/* PSF2 폰트 (Class 61) */
+#include "../../font/psf2.h"
+
+static struct psf2_font g_term_psf2;
+static int g_font_w = 8;
+static int g_font_h = 8;
+
 /* ============================================================
  * 터미널 상수 & 데이터 구조
  * ============================================================ */
@@ -72,8 +79,8 @@
  */
 #define TERM_COLS	80
 #define TERM_ROWS	25
-#define TERM_WIDTH	(TERM_COLS * 8)		/* 640 */
-#define TERM_HEIGHT	(TERM_ROWS * 8)		/* 200 */
+#define TERM_WIDTH	(TERM_COLS * g_font_w)
+#define TERM_HEIGHT	(TERM_ROWS * g_font_h)
 
 /* 색상 */
 #define COLOR_BG	0x00000000	/* 검정 배경 */
@@ -426,37 +433,38 @@ static void term_render(struct terminal *term)
 			if (ch < 32 || ch > 126)
 				continue;
 
-			int px_x = col * 8;
-			int px_y = row * 8;
-			const uint8_t *glyph = font8x8_basic[(int)ch];
+			int px_x = col * g_font_w;
+			int px_y = row * g_font_h;
 
-			for (int gy = 0; gy < 8; gy++) {
-				int y = px_y + gy;
-
-				if (y >= h)
-					break;
-				for (int gx = 0; gx < 8; gx++) {
-					int x = px_x + gx;
-
-					if (x >= w)
-						break;
-					if (glyph[gy] & (1 << gx))
-						px[y * w + x] = COLOR_FG;
+			if (g_term_psf2.loaded) {
+				psf2_draw_char(px, w, px_x, px_y, ch,
+					       COLOR_FG, &g_term_psf2);
+			} else {
+				const uint8_t *glyph = font8x8_basic[(int)ch];
+				for (int gy = 0; gy < 8; gy++) {
+					int y = px_y + gy;
+					if (y >= h) break;
+					for (int gx = 0; gx < 8; gx++) {
+						int x = px_x + gx;
+						if (x >= w) break;
+						if (glyph[gy] & (1 << gx))
+							px[y * w + x] = COLOR_FG;
+					}
 				}
 			}
 		}
 	}
 
 	/* 3. 블록 커서 그리기 */
-	int cx = term->cursor_col * 8;
-	int cy = term->cursor_row * 8;
+	int cx = term->cursor_col * g_font_w;
+	int cy = term->cursor_row * g_font_h;
 
-	for (int gy = 0; gy < 8; gy++) {
+	for (int gy = 0; gy < g_font_h; gy++) {
 		int y = cy + gy;
 
 		if (y >= h)
 			break;
-		for (int gx = 0; gx < 8; gx++) {
+		for (int gx = 0; gx < g_font_w; gx++) {
 			int x = cx + gx;
 
 			if (x >= w)
@@ -472,20 +480,27 @@ static void term_render(struct terminal *term)
 				     [term->cursor_col].ch;
 
 		if (ch >= 32 && ch <= 126) {
-			const uint8_t *glyph = font8x8_basic[(int)ch];
+			if (g_term_psf2.loaded) {
+				psf2_draw_char(px, w, cx, cy, ch,
+					       COLOR_BG, &g_term_psf2);
+			} else {
+				const uint8_t *glyph =
+					font8x8_basic[(int)ch];
 
-			for (int gy = 0; gy < 8; gy++) {
-				int y = cy + gy;
+				for (int gy = 0; gy < 8; gy++) {
+					int y = cy + gy;
 
-				if (y >= h)
-					break;
-				for (int gx = 0; gx < 8; gx++) {
-					int x = cx + gx;
-
-					if (x >= w)
+					if (y >= h)
 						break;
-					if (glyph[gy] & (1 << gx))
-						px[y * w + x] = COLOR_BG;
+					for (int gx = 0; gx < 8; gx++) {
+						int x = cx + gx;
+
+						if (x >= w)
+							break;
+						if (glyph[gy] & (1 << gx))
+							px[y * w + x] =
+								COLOR_BG;
+					}
 				}
 			}
 		}
@@ -506,13 +521,65 @@ static void term_render(struct terminal *term)
  * PTY에 쓰면 쉘이 읽을 수 있음:
  *   write(pty_master, "a", 1) → 쉘의 stdin에서 read()로 'a' 수신
  */
+/*
+ * Ctrl+Shift+C: 화면 마지막 줄 복사 (간단한 초기 구현)
+ * 실제 터미널은 마우스 선택 영역을 복사하지만,
+ * 마우스 선택이 미구현이므로 현재 커서 행을 복사.
+ */
+static void term_clipboard_copy(struct terminal *term)
+{
+	char line[TERM_COLS + 1];
+	int row = term->cursor_row > 0 ? term->cursor_row - 1 : 0;
+	int end = TERM_COLS;
+
+	/* 행 끝의 공백 제거 */
+	while (end > 0 && (term->cells[row][end - 1].ch == '\0' ||
+			   term->cells[row][end - 1].ch == ' '))
+		end--;
+
+	for (int i = 0; i < end; i++)
+		line[i] = term->cells[row][i].ch ? term->cells[row][i].ch : ' ';
+	line[end] = '\0';
+
+	if (end > 0)
+		cdp_clipboard_set(term->conn, line, (uint32_t)end);
+}
+
+/*
+ * 클립보드 붙여넣기 콜백용 전역 (poll 루프에서 사용)
+ */
+static struct terminal *g_paste_term;
+
+static void term_on_clipboard_paste(const char *text, uint32_t len)
+{
+	if (!g_paste_term || !text || len == 0)
+		return;
+
+	/* PTY에 텍스트 전송 → 쉘 입력으로 처리됨 */
+	ssize_t ret = write(g_paste_term->pty_master, text, len);
+	(void)ret;
+}
+
 static void term_handle_key(struct terminal *term,
 			    uint32_t keycode, uint32_t state,
-			    char character)
+			    uint32_t modifiers, char character)
 {
 	/* 키 릴리스(state=0)는 무시 */
 	if (state == 0)
 		return;
+
+	/* Ctrl+Shift+C → 복사 */
+	if ((modifiers & (CDP_MOD_CTRL | CDP_MOD_SHIFT)) ==
+	    (CDP_MOD_CTRL | CDP_MOD_SHIFT)) {
+		if (keycode == KEY_C) {
+			term_clipboard_copy(term);
+			return;
+		}
+		if (keycode == KEY_V) {
+			cdp_clipboard_get(term->conn);
+			return; /* 결과는 콜백으로 */
+		}
+	}
 
 	char buf[8];
 	int len = 0;
@@ -742,7 +809,7 @@ static void term_event_loop(struct terminal *term)
 		/* CDP 소켓에서 이벤트 수신 */
 		if (fds[0].revents & POLLIN) {
 			uint32_t type, size;
-			uint8_t payload[256];
+			uint8_t payload[CDP_MSG_MAX_PAYLOAD];
 
 			if (cdp_recv_msg(term->conn->sock_fd, &type,
 					 payload, sizeof(payload),
@@ -758,6 +825,7 @@ static void term_event_loop(struct terminal *term)
 					(struct cdp_key *)payload;
 				term_handle_key(term, key->keycode,
 						key->state,
+						key->modifiers,
 						(char)key->character);
 				break;
 			}
@@ -770,6 +838,13 @@ static void term_event_loop(struct terminal *term)
 				}
 				cdp_request_frame(term->conn, term->win);
 				break;
+			case CDP_EVT_CLIPBOARD_DATA:
+			{
+				struct cdp_clipboard_data *cb =
+					(struct cdp_clipboard_data *)payload;
+				term_on_clipboard_paste(cb->text, cb->len);
+				break;
+			}
 			default:
 				break;
 			}
@@ -824,6 +899,16 @@ int main(void)
 
 	printf("\n=== CITC Terminal Emulator ===\n\n");
 
+	/* 0. PSF2 폰트 로드 (Class 61) */
+	if (psf2_load(&g_term_psf2, "/usr/share/fonts/ter-116n.psf") == 0) {
+		g_font_w = (int)g_term_psf2.width;
+		g_font_h = (int)g_term_psf2.height;
+		printf("  PSF2 폰트 로드: %ux%u\n", g_term_psf2.width,
+		       g_term_psf2.height);
+	} else {
+		printf("  PSF2 폰트 없음 — font8x8 사용 (8x8)\n");
+	}
+
 	/* 1. 컴포지터에 연결 */
 	printf("[1/3] 컴포지터에 연결...\n");
 	term.conn = cdp_connect();
@@ -865,7 +950,11 @@ int main(void)
 	cdp_request_frame(term.conn, term.win);
 	term.dirty = 0;
 
-	printf("\ncitcterm 시작! 터미널 윈도우를 클릭하여 포커스를 설정하세요.\n\n");
+	printf("\ncitcterm 시작! 터미널 윈도우를 클릭하여 포커스를 설정하세요.\n");
+	printf("  Ctrl+Shift+C: 복사  |  Ctrl+Shift+V: 붙여넣기\n\n");
+
+	/* 클립보드 콜백 설정 */
+	g_paste_term = &term;
 
 	/* 이벤트 루프 */
 	term_event_loop(&term);

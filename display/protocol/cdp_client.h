@@ -123,6 +123,8 @@ struct cdp_conn {
 	void (*on_frame)(uint32_t surface_id);
 	void (*on_focus_in)(uint32_t surface_id);
 	void (*on_focus_out)(uint32_t surface_id);
+	void (*on_configure)(uint32_t surface_id, int width, int height);
+	void (*on_clipboard_data)(const char *text, uint32_t len);
 };
 
 /* ============================================================
@@ -456,6 +458,32 @@ static void cdp_set_panel(struct cdp_conn *conn, struct cdp_window *win,
 }
 
 /*
+ * 데미지 영역 보고
+ * Wayland: wl_surface.damage_buffer()
+ *
+ * 클라이언트가 버퍼의 어떤 영역을 변경했는지 서버에 알림.
+ * 서버는 이 정보를 사용하여 해당 영역만 다시 합성.
+ */
+__attribute__((unused))
+static void cdp_damage(struct cdp_conn *conn, struct cdp_window *win,
+		       int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	if (!conn || !win || !win->active)
+		return;
+
+	struct cdp_damage req;
+
+	req.surface_id = win->surface_id;
+	req.x = x;
+	req.y = y;
+	req.w = w;
+	req.h = h;
+
+	cdp_send_msg(conn->sock_fd, CDP_REQ_DAMAGE,
+		     &req, sizeof(req));
+}
+
+/*
  * Surface 삭제
  * Wayland: wl_surface.destroy()
  */
@@ -480,6 +508,104 @@ static void cdp_destroy_surface(struct cdp_conn *conn, struct cdp_window *win)
 		win->shm_fd = -1;
 	}
 	win->active = 0;
+}
+
+/* ============================================================
+ * 클립보드 API (Class 62)
+ * ============================================================
+ *
+ * Wayland 대응:
+ *   cdp_clipboard_set  ↔  wl_data_source + wl_data_device.set_selection
+ *   cdp_clipboard_get  ↔  wl_data_offer.receive (파이프 기반)
+ *
+ * CDP에서는 단순화하여 텍스트를 직접 메시지로 전달.
+ * Wayland는 MIME 타입 + 파이프 기반이라 더 복잡.
+ */
+
+/*
+ * 클립보드에 텍스트 설정 (복사)
+ */
+__attribute__((unused))
+static void cdp_clipboard_set(struct cdp_conn *conn,
+			      const char *text, uint32_t len)
+{
+	if (!conn || !text || len == 0)
+		return;
+
+	if (len > CDP_CLIPBOARD_MAX)
+		len = CDP_CLIPBOARD_MAX;
+
+	struct cdp_clipboard_set req;
+
+	req.len = len;
+	memcpy(req.text, text, len);
+	if (len < CDP_CLIPBOARD_MAX)
+		req.text[len] = '\0';
+
+	/* len + 4(len필드) + 1(null) */
+	uint32_t msg_size = sizeof(uint32_t) + len + 1;
+
+	cdp_send_msg(conn->sock_fd, CDP_REQ_CLIPBOARD_SET,
+		     &req, msg_size);
+}
+
+/*
+ * 윈도우 포커스/복원 (Class 63)
+ * 태스크바에서 윈도우 클릭 시 사용.
+ */
+__attribute__((unused))
+static void cdp_raise_surface(struct cdp_conn *conn, uint32_t surface_id)
+{
+	if (!conn)
+		return;
+
+	struct cdp_raise_surface req;
+
+	req.surface_id = surface_id;
+	cdp_send_msg(conn->sock_fd, CDP_REQ_RAISE_SURFACE,
+		     &req, sizeof(req));
+}
+
+/*
+ * 윈도우 목록 요청 (Class 63)
+ *
+ * 동기: 응답을 직접 받아서 반환.
+ */
+__attribute__((unused))
+static int cdp_list_windows(struct cdp_conn *conn,
+			    struct cdp_window_list *out)
+{
+	if (!conn || !out)
+		return -1;
+
+	cdp_send_msg(conn->sock_fd, CDP_REQ_LIST_WINDOWS, NULL, 0);
+
+	uint32_t type, size;
+	uint8_t payload[CDP_MSG_MAX_PAYLOAD];
+
+	if (cdp_recv_msg(conn->sock_fd, &type, payload,
+			 sizeof(payload), &size) < 0)
+		return -1;
+
+	if (type != CDP_EVT_WINDOW_LIST)
+		return -1;
+
+	memcpy(out, payload, size < sizeof(*out) ? size : sizeof(*out));
+	return 0;
+}
+
+/*
+ * 클립보드 내용 요청 (붙여넣기)
+ *
+ * 비동기: 결과는 on_clipboard_data 콜백으로 전달.
+ */
+__attribute__((unused))
+static void cdp_clipboard_get(struct cdp_conn *conn)
+{
+	if (!conn)
+		return;
+
+	cdp_send_msg(conn->sock_fd, CDP_REQ_CLIPBOARD_GET, NULL, 0);
 }
 
 /* ============================================================
@@ -564,6 +690,23 @@ static int cdp_dispatch(struct cdp_conn *conn)
 
 		if (conn->on_focus_out)
 			conn->on_focus_out(evt->surface_id);
+		break;
+	}
+	case CDP_EVT_CONFIGURE: {
+		struct cdp_configure *evt = (struct cdp_configure *)payload;
+
+		if (conn->on_configure)
+			conn->on_configure(evt->surface_id,
+					   (int)evt->width,
+					   (int)evt->height);
+		break;
+	}
+	case CDP_EVT_CLIPBOARD_DATA: {
+		struct cdp_clipboard_data *evt =
+			(struct cdp_clipboard_data *)payload;
+
+		if (conn->on_clipboard_data)
+			conn->on_clipboard_data(evt->text, evt->len);
 		break;
 	}
 	default:
